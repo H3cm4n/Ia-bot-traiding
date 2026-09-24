@@ -13,3 +13,10 @@ __pycache__/
 paper_portfolio.json
 __pycache__/
 *.pyc
+
+.env
+paper_portfolio.json
+shadow_run.log
+__pycache__/
+*.pyc
+venv/
