@@ -1,33 +1,28 @@
 """
 connectors/polymarket_ingest.py
-Módulo para la ingesta de datos en vivo desde la API de Polymarket (Gamma/CLOB API).
+Ingesta orientada a búsquedas de alto volumen (Crypto/Fed) con soporte dinámico para YES/NO.
 """
 
 import urllib.request
+import urllib.parse
 import json
 import sys
-from pathlib import Path
 
-# Configuración de URLs públicas de Polymarket
-GAMMA_API_URL = "https://gamma-api.polymarket.com/events?closed=false&limit=10&volume_num_min=1000"
+SEARCH_QUERIES = ["bitcoin", "crypto", "ethereum", "fed"]
 
-def fetch_active_markets():
-    """Consulta eventos y mercados activos desde Gamma API."""
+def fetch_markets_by_query(query: str) -> list:
+    encoded_query = urllib.parse.quote(query)
+    url = f"https://gamma-api.polymarket.com/events?closed=false&limit=10&q={encoded_query}"
     try:
-        req = urllib.request.Request(
-            GAMMA_API_URL, 
-            headers={'User-Agent': 'Mozilla/5.0'}
-        )
-        with urllib.request.urlopen(req, timeout=10) as response:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=8) as response:
             if response.status == 200:
-                data = json.loads(response.read().decode('utf-8'))
-                return data
+                return json.loads(response.read().decode('utf-8'))
     except Exception as e:
-        sys.stderr.write(f"[ERROR Ingesta] Fallo al consultar API Polymarket: {e}\n")
-        return []
+        sys.stderr.write(f"[ERROR Ingesta] Error consultando query '{query}': {e}\n")
+    return []
 
-def parse_candidates(events: list) -> list:
-    """Transforma los eventos de Polymarket al esquema de candidatos del bot."""
+def parse_candidates_multi_side(events: list) -> list:
     candidates = []
     
     for event in events:
@@ -36,38 +31,57 @@ def parse_candidates(events: list) -> list:
             condition_id = market.get("conditionId")
             clob_token_ids = market.get("clobTokenIds")
             
-            # Validar que el mercado esté activo y tenga identificadores
             if not condition_id or not clob_token_ids:
                 continue
 
-            # Obtener precios/probabilidades aproximadas si están disponibles
             outcome_prices = market.get("outcomePrices")
-            price_yes = float(json.loads(outcome_prices)[0]) if outcome_prices else 0.50
+            if not outcome_prices:
+                continue
 
-            # Estructurar candidato compatible con el ejecutor
-            candidate = {
-                "condition_id": condition_id,
-                "outcome": "YES",
-                "limit_price": round(price_yes, 2),
-                "amount": 10.0,
-                "question": market.get("question", "Sin título"),
-                "slug": market.get("slug", "")
-            }
-            candidates.append(candidate)
-            
-            # Limitar a máximo 5 candidatos por ciclo para mantener la eficiencia
-            if len(candidates) >= 5:
+            try:
+                prices = json.loads(outcome_prices)
+                price_yes = float(prices[0])
+                price_no = float(prices[1]) if len(prices) > 1 else (1.0 - price_yes)
+            except Exception:
+                continue
+
+            # Evaluar lado YES si el precio es razonable (> 0.20)
+            if price_yes >= 0.20:
+                candidates.append({
+                    "condition_id": condition_id,
+                    "outcome": "YES",
+                    "limit_price": round(price_yes, 2),
+                    "amount": 10.0,
+                    "question": market.get("question", "Sin título")
+                })
+
+            # Evaluar lado NO si el precio de YES es bajo (lo que implica un precio de NO alto)
+            if price_no >= 0.40:
+                candidates.append({
+                    "condition_id": condition_id,
+                    "outcome": "NO",
+                    "limit_price": round(price_no, 2),
+                    "amount": 10.0,
+                    "question": f"{market.get('question', 'Sin título')} [LADO NO]"
+                })
+
+            if len(candidates) >= 15:
                 break
-        if len(candidates) >= 5:
+        if len(candidates) >= 15:
             break
             
     return candidates
 
 def get_live_snapshot():
-    events = fetch_active_markets()
-    return parse_candidates(events)
+    all_events = []
+    for q in SEARCH_QUERIES:
+        events = fetch_markets_by_query(q)
+        all_events.extend(events)
+        if len(all_events) >= 20:
+            break
+            
+    return parse_candidates_multi_side(all_events)
 
 if __name__ == "__main__":
-    # Si se ejecuta directamente, imprime los candidatos parseados en JSON para la tubería (stdout)
     snapshot = get_live_snapshot()
     print(json.dumps(snapshot))
