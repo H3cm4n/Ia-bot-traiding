@@ -24,12 +24,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger("directional_executor")
 
+# Instancia global del ejecutor para mantener el estado entre ráfagas
+executor = PaperExecutor(max_pending_orders=3)
+
 def process_snapshot(candidates: list):
-    executor = PaperExecutor()
+    """
+    Procesa una ráfaga de candidatos usando el método execute_candidates
+    que aplica filtros de unicidad y cooldown, y luego registra los eventos en SQLite.
+    """
+    # 1. Procesar la ráfaga completa con filtros integrados
+    results = executor.execute_candidates(candidates)
     
-    for candidate in candidates:
-        # Llamada al método correcto: process_signal
-        res = executor.process_signal(candidate)
+    # 2. Iterar sobre los resultados para logging y persistencia
+    for candidate, res in zip(candidates, results):
         status = res.get("status")
         action = res.get("action", status)
         match_key = res.get("match_key", "")
@@ -42,6 +49,7 @@ def process_snapshot(candidates: list):
         # Obtener el precio buscando ambas claves posibles
         order_price = candidate.get("limit_price", candidate.get("price"))
 
+        # Persistir el evento en la base de datos
         log_order_event(
             match_key=match_key,
             action=action,

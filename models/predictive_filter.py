@@ -25,7 +25,7 @@ logging.basicConfig(
 logger = logging.getLogger("predictive_filter")
 
 MODEL_PATH = Path(__file__).resolve().parent / "model_filter.pkl"
-WIN_PROBABILITY_THRESHOLD = 0.40  # Exigir un mínimo de 40% de probabilidad estimada de ganar
+WIN_PROBABILITY_THRESHOLD = 0.50  # Exigir un mínimo de 50% de probabilidad estimada de ganar
 
 # Cargar el modelo si existe
 clf_model = None
@@ -53,7 +53,7 @@ def evaluate_candidate(candidate: dict) -> tuple[bool, str]:
             win_prob = probabilities[1] if len(probabilities) > 1 else probabilities[0]
 
             if win_prob < WIN_PROBABILITY_THRESHOLD:
-                return False, f"PROBABILIDAD_INSUFICIENTE_({win_prob*100:.1f}%_<_40%)"
+                return False, f"PROBABILIDAD_INSUFICIENTE_({win_prob*100:.1f}%_<_50%)"
             
             return True, f"PASSED_MODEL_PROB_({win_prob*100:.1f}%)"
         except Exception as e:
