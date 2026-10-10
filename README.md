@@ -1,45 +1,80 @@
-# Polymarket AI Bot
+# Polymarket AI Trading Bot 🚀
 
-Bot experimental para analizar mercados de Polymarket en modo seguro.
+Bot de trading algorítmico y auto-sostenible diseñado para operar en mercados de predicción en **Polymarket**. Combina ingesta de datos en tiempo real, filtrado por **Machine Learning** (Scikit-Learn), gestión conservadora de PnL y sincronización continua de memoria con **SQLite**.
 
-## Estado actual
+---
 
-El bot funciona en modo **READ-ONLY** y **PAPER-TRADING**.
+## 🛠️ Características Principales
 
-No usa wallet.
-No usa private key.
-No ejecuta compras reales.
-No vende posiciones reales.
+* **Filtrado Predictivo de Machine Learning:** Evalúa la probabilidad de éxito de cada candidato usando un modelo probabilístico (`model_filter.pkl`) con un umbral de aprobación del **50%**.
+* **Gestión de Riesgo y PnL Ajustado:** 
+  * **Take-Profit (TP):** +30%
+  * **Stop-Loss (SL):** -15%
+* **Sincronización de Memoria en Vivo:** Purgado automático de órdenes en memoria local (`PaperExecutor`) tras ser liquidadas por el resolutor de mercados (`check_and_settle_orders`), evitando bloqueos por estado duplicado (`CONDITION_ALREADY_ACTIVE`).
+* **Auto-Entrenamiento Continuo:** Re-entrena el modelo ML automáticamente cada ciertos ciclos utilizando los resultados históricos reales almacenados en la base de datos.
+* **Control de Cooldown y Duplicados:** Filtros en SQLite y en memoria para evitar reoperar el mismo mercado o procesar señales contradictorias (YES/NO) en la misma ráfaga.
 
-## Funciones actuales
+---
 
-- Lee eventos activos de Polymarket.
-- Consulta orderbooks públicos.
-- Calcula bid, ask, spread, mid price y liquidez.
-- Genera score de señales.
-- Penaliza spreads relativos altos.
-- Simula compras paper.
-- Evita comprar ambos lados del mismo mercado.
-- Valúa posiciones abiertas.
-- Cierra posiciones paper por stop-loss o take-profit.
-- Genera reporte de performance.
+## 🏗️ Arquitectura del Sistema
 
-## Comandos principales
+polymarket-ai-bot/
+├── analytics/
+│   └── performance.py               # Cálculo de métricas de rendimiento y esperanza matemática (Ev)
+├── connectors/
+│   └── polymarket_ingest.py        # Ingesta de snapshot de mercados activos desde la API de Polymarket
+├── data/
+│   └── trading_bot.db               # Base de datos SQLite para persistencia de órdenes e historial
+├── database/
+│   └── db_manager.py                # CRUD y actualización de PnL para órdenes
+├── executors/
+│   └── paper_executor.py            # Motor de simulación (Paper Trading), manejo de cooldown y purga
+├── models/
+│   ├── model_filter.pkl             # Binario del modelo ML entrenado
+│   ├── predictive_filter.py         # Filtro predictivo de candidatos por umbral de probabilidad (50%)
+│   └── train_filter.py              # Pipeline de re-entrenamiento automático del modelo ML
+├── services/
+│   └── order_settlement_resolver.py # Verificación de resolución de mercados/precios en tiempo real
+├── tools/
+│   └── directional_limit_hunter_executor.py # Ejecutor global de candidatos aprobados
+└── main.py                          # Orquestador principal del ciclo continuo
 
+---
+
+## 🔄 Flujo de Ejecución en Cada Ciclo
+
+1. **Resolución y Sincronización:** `check_and_settle_orders()` verifica si las órdenes activas alcanzaron el TP (+30%), SL (-15%) o cierre del mercado, y purga sus claves (`match_key`) de la memoria de `PaperExecutor`.
+2. **Ingesta de Mercado:** `get_live_snapshot()` recupera las oportunidades de mercado actuales.
+3. **Filtro ML:** `filter_snapshot()` evalúa cada candidato con el modelo predictivo y descarta aquellos con probabilidad menor al 50%.
+4. **Ejecución de Órdenes:** `process_snapshot()` aplica validaciones de unicidad, cooldown y registra el evento `PENDING_CREATED` en SQLite.
+5. **Auto-Entrenamiento & Analítica:** Cada 5 ciclos, el sistema entrena el modelo con el historial más reciente e imprime el **Reporte de Rendimiento (Ev)**.
+
+---
+
+## 🚀 Instalación y Uso
+
+### 1. Clonar el repositorio
 ```bash
-python main.py snapshot
-python main.py snapshot --alerts --min-score 50
-python main.py snapshot --alerts --min-score 50 --paper --paper-size 5 --paper-min-score 75
+git clone [https://github.com/H3cm4n/Ia-bot-traiding.git](https://github.com/H3cm4n/Ia-bot-traiding.git)
+cd Ia-bot-traiding
 
-python main.py scan --cycles 2 --interval 10 --alerts --min-score 65
-python main.py portfolio
-python main.py paper-manage
-python main.py paper-manage --close
-python main.py paper-report
-```
+### 2. Crear entorno virtual e instalar dependencias
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
 
-## Seguridad
+### 3. Ejecutar el orquestador principal
+python3 main.py
 
-Este proyecto todavía no debe usarse con dinero real.
+### 📊 Métricas y Reportes
 
-LIVE_TRADING debe permanecer en false.
+El bot genera reportes de desempeño automáticos al finalizar ejecuciones o durante la rutina de entrenamiento:
+
+
+=== REPORTE DE RENDIMIENTO (Ev) ===
+Total Trades Cerrados: 10
+Tasa de Acierto (Win Rate): 100.00%
+Ganancia Promedio: $3.60
+Pérdida Promedio: $0.00
+Esperanza Matemática (Ev): $3.6000 por operación
+===================================
