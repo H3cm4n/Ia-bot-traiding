@@ -1,88 +1,64 @@
 """
 tools/generate_pnl_report.py
-Generador de reportes de rendimiento y PnL por activo para Directional Limit Hunter v1.5.
+Generador de reportes de rendimiento y PnL por activo leyendo SQLite.
 """
 
-import os
-import csv
+import sqlite3
 import sys
-from typing import Dict, List
-from core.logger import PnLLogger
+from pathlib import Path
 
-def parse_symbol_from_key(match_key: str, condition_id: str) -> str:
-    key_upper = match_key.upper()
-    if 'BTC' in key_upper:
-        return 'BTC'
-    elif 'ETH' in key_upper:
-        return 'ETH'
-    elif 'SOL' in key_upper:
-        return 'SOL'
-    elif 'XRP' in key_upper:
-        return 'XRP'
-    return 'OTROS'
+DB_PATH = Path("data/trading_bot.db")
 
-def generate_report(csv_path: str = 'data/trade_history.csv'):
-    if not os.path.exists(csv_path):
-        print(f"[!] No se encontro el archivo de historial en: {csv_path}")
-        print("[i] Ejecuta primero ciclos de paper trading para generar registros de operaciones.")
+def generate_report():
+    if not DB_PATH.exists():
+        print(f"[!] No se encontró la base de datos en: {DB_PATH}")
         return
 
-    logger = PnLLogger(output_dir=os.path.dirname(csv_path), filename=os.path.basename(csv_path))
-    stats = logger.calculate_stats()
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
 
-    if stats['total_trades'] == 0:
-        print('==================================================')
-        print('          REPORTE DE RENDIMIENTO PnL (v1.5)       ')
-        print('==================================================')
-        print('Sin operaciones cerradas registradas aun.')
-        print('==================================================')
+        # Resumen general por estado/acción
+        cursor.execute("SELECT action, COUNT(*), SUM(pnl) FROM orders_history GROUP BY action")
+        orders_summary = cursor.fetchall()
+
+        # Posiciones liquidadas (WIN / LOSS / CLOSED)
+        cursor.execute("""
+            SELECT symbol, action, price, amount, pnl 
+            FROM orders_history 
+            WHERE pnl IS NOT NULL AND pnl != 0.0
+        """)
+        closed_trades = cursor.fetchall()
+
+    print("==================================================")
+    print("      REPORTE DE RENDIMIENTO DIRECTIONAL v1.5     ")
+    print("==================================================")
+
+    if not orders_summary:
+        print("Sin operaciones registradas aún en la base de datos.")
+        print("==================================================")
         return
 
-    by_asset: Dict[str, Dict] = {}
-    durations: List[float] = []
+    print("RESUMEN GENERAL DE ÓRDENES:")
+    for action, count, total_pnl in orders_summary:
+        pnl_val = total_pnl if total_pnl is not None else 0.0
+        print(f"  * Estado: {action:<18} | Cantidad: {count:<4} | PnL Acumulado: ${pnl_val:+.2f} USDC")
 
-    with open(csv_path, mode='r', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            match_key = row.get('match_key', '')
-            cond_id = row.get('condition_id', '')
-            pnl_pct = float(row.get('pnl_pct', 0.0))
-            pnl_usd = float(row.get('pnl_usd', 0.0))
-            duration = float(row.get('duration_seconds', 0.0))
-
-            asset = parse_symbol_from_key(match_key, cond_id)
-            if asset not in by_asset:
-                by_asset[asset] = {'trades': 0, 'wins': 0, 'pnl_usd': 0.0, 'pnl_pct': 0.0}
-
-            by_asset[asset]['trades'] += 1
-            if pnl_pct > 0:
-                by_asset[asset]['wins'] += 1
-            by_asset[asset]['pnl_usd'] += pnl_usd
-            by_asset[asset]['pnl_pct'] += pnl_pct
-            durations.append(duration)
-
-    avg_duration_min = round((sum(durations) / len(durations)) / 60.0, 2) if durations else 0.0
-
-    print('==================================================')
-    print('      REPORTE DE RENDIMIENTO DIRECTIONAL v1.5     ')
-    print('==================================================')
-    print(f"Total Trades Cerrados : {stats['total_trades']}")
-    print(f"Win Rate Global       : {stats['win_rate']*100:.2f}%")
-    print(f"PnL Acumulado (USD)   : ${stats['total_pnl_usd']:.2f}")
-    print(f"PnL Acumulado (%)     : {stats['total_pnl_pct']*100:.2f}%")
-    print(f"Max Drawdown (USD)    : ${stats['max_drawdown']:.2f}")
-    print(f"Duracion Promedio     : {avg_duration_min} min")
-    print('--------------------------------------------------')
-    print('DESGLOSE POR ACTIVO:')
-    print(f"{'ACTIVO':<8} | {'TRADES':<7} | {'WIN RATE':<10} | {'PnL (USD)':<10}")
-    print('--------------------------------------------------')
+    print("--------------------------------------------------")
     
-    for asset, a_stats in by_asset.items():
-        wr = (a_stats['wins'] / a_stats['trades']) * 100 if a_stats['trades'] > 0 else 0.0
-        print(f"{asset:<8} | {a_stats['trades']:<7} | {wr:<9.1f}% | ${a_stats['pnl_usd']:<9.2f}")
+    if not closed_trades:
+        print("Sin operaciones cerradas con PnL finalizado aún.")
+        print("==================================================")
+        return
 
-    print('==================================================')
+    total_trades = len(closed_trades)
+    wins = [t for t in closed_trades if t[4] > 0]
+    total_pnl = sum(t[4] for t in closed_trades)
+    win_rate = (len(wins) / total_trades) * 100 if total_trades > 0 else 0.0
 
-if __name__ == '__main__':
-    path = sys.argv[1] if len(sys.argv) > 1 else 'data/trade_history.csv'
-    generate_report(path)
+    print(f"Total Trades Cerrados : {total_trades}")
+    print(f"Win Rate Global       : {win_rate:.2f}%")
+    print(f"PnL Acumulado (USDC)  : ${total_pnl:+.2f}")
+    print("==================================================")
+
+if __name__ == "__main__":
+    generate_report()
