@@ -29,14 +29,13 @@ logging.basicConfig(
 logger = logging.getLogger("predictive_filter")
 
 # ---------------------------------------------------------------------- #
-# Parámetros del modelo y modelo de costos
+# Parámetros del modelo y modelo de costos (Ajuste de Alta Exigencia)
 # ---------------------------------------------------------------------- #
-MIN_REQUIRED_EV = 0.02           # 2.0% de margen de seguridad neto mínimo
+MIN_REQUIRED_EV = 0.08          # Elevar el margen de ventaja neto del 5% al 8.0%
 DEFAULT_DAILY_VOLATILITY = 0.035  # 3.5% volatilidad diaria base
-DEFAULT_FAIR_PROB = 0.50         # Fallback conservador sin datos spot/strike
-MIN_EXECUTABLE_PRICE = 0.02
-MAX_EXECUTABLE_PRICE = 0.98
-
+DEFAULT_FAIR_PROB = 0.65        # Elevar la probabilidad mínima exigida del 60% al 65%
+MIN_EXECUTABLE_PRICE = 0.15     # Mantener suelo de precio ejecutable
+MAX_EXECUTABLE_PRICE = 0.55     # Mantener techo de precio ejecutable (asimetría favorable)
 
 def calculate_dynamic_ev(
     fair_prob: float,
@@ -180,7 +179,7 @@ def evaluate_candidate(candidate: dict) -> tuple[bool, str, dict]:
     }
 
     if ev_net < MIN_REQUIRED_EV:
-        return False, f"EV_INSUFICIENTE_({ev_net:.4f}_<_0.0200)", metrics
+        return False, f"EV_INSUFICIENTE_({ev_net:.4f}_<_{MIN_REQUIRED_EV:.4f})", metrics
 
     return True, f"PASSED_DYNAMIC_EV_({ev_net:+.4f})", metrics
 
@@ -201,9 +200,8 @@ def filter_snapshot(candidates: list) -> list:
             )
             continue
 
-        match_key = str(
-            candidate.get("condition_id", candidate.get("symbol", "DESCONOCIDO"))
-        )[:10]
+        raw_key = candidate.get("condition_id") or candidate.get("symbol") or "DESCONOCIDO"
+        match_key = str(raw_key)[:10] if raw_key != "DESCONOCIDO" else "DESCONOCIDO"
 
         if passed:
             logger.info(

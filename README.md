@@ -78,3 +78,31 @@ Ganancia Promedio: $3.60
 Pérdida Promedio: $0.00
 Esperanza Matemática (Ev): $3.6000 por operación
 ===================================
+
+# 🚀 Estado del Sistema (v2.2 Shadow Runner)
+
+El bot opera de manera autónoma en segundo plano ejecutando un ciclo continuo de 3 pasos cada 300 segundos:
+1. **Liquidación Automática**: Actualización de órdenes pendientes en SQLite (`orders_history`) a estados finales (`WIN`/`LOSS`).
+2. **Auto-entrenamiento ML**: Re-entrenamiento automático del modelo cuando se acumulan $\ge 50$ muestras liquidadas.
+3. **Ingesta, Inferencia y Filtrado**: Evaluación dinámica de $EV_{\text{net}}$ con deduplicación e idempotencia previa contra SQLite.
+
+### 🛡️ Parámetros de Alta Exigencia y Gestión de Riesgo
+- **Margen $EV_{\text{net}}$ mínimo**: `0.08` ($+8.0\%$ de ventaja requerida considerando spread, fees y slippage).
+- **Probabilidad justa ($P_{\text{fair}}$) base**: `0.65` ($65\%$ de confianza mínima).
+- **Rango de precio ejecutable**: $0.15 \le P_{\text{entry}} \le 0.55$ (asegura asimetría riesgo/beneficio favorable).
+- **Idempotencia y Deduplicación**: Prevención estricta de entradas duplicadas en el mismo mercado/lado mediante `is_market_already_traded`.
+
+### 📊 Comando para Auditoría de Rendimiento Deduplicado
+Para auditar la rentabilidad real contando únicamente 1 entrada por mercado/lado:
+```bash
+sqlite3 data/trading_bot.db "SELECT 
+    COUNT(DISTINCT symbol) as total_mercados_unicos,
+    SUM(CASE WHEN action = 'WIN' THEN 1 ELSE 0 END) as wins_unicos,
+    SUM(CASE WHEN action = 'LOSS' THEN 1 ELSE 0 END) as losses_unicos,
+    SUM(pnl) as pnl_deduplicado_real
+FROM (
+    SELECT symbol, side, action, pnl 
+    FROM orders_history 
+    WHERE action IN ('WIN', 'LOSS')
+    GROUP BY symbol, side
+);"
