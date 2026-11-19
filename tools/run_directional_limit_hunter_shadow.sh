@@ -23,9 +23,9 @@ while true; do
     echo "--------------------------------------------------"
     echo "[$TIMESTAMP] Iniciando ciclo..."
 
-    # PASO 1: Simulación de liquidación de órdenes abiertas
-    echo "[$TIMESTAMP] [PASO 1/2] Liquidación de órdenes pendientes..."
-    if $PYTHON_BIN tools/simulate_settlement.py; then
+    # PASO 1: Liquidación real contra Polymarket Gamma API
+    echo "[$TIMESTAMP] [PASO 1/2] Liquidación real de órdenes pendientes..."
+    if $PYTHON_BIN services/real_settlement_resolver.py; then
         echo "[$TIMESTAMP] Liquidación OK."
     else
         echo "[$TIMESTAMP] [WARN] Falló la liquidación; se continúa el ciclo."
