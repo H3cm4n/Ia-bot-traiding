@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Panel de Rendimiento | Polymarket AI Bot</title>
+  <style>
+    :root {
+      --bg: #08080a;
+      --bg-soft: #101014;
+      --panel: #15151a;
+      --panel-2: #1c1c23;
+      --border: #2a2a33;
+      --gold: #d4af37;
+      --gold-soft: rgba(212, 175, 55, 0.14);
+      --green: #2ecc71;
+      --green-soft: rgba(46, 204, 113, 0.14);
+      --red: #e74c3c;
+      --red-soft: rgba(231, 76, 60, 0.14);
+      --text: #f4f1e8;
+      --muted: #9b9ba6;
+      --radius: 16px;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at top left, rgba(212, 175, 55, 0.12), transparent 32rem),
+        radial-gradient(circle at bottom right, rgba(46, 204, 113, 0.07), transparent 28rem),
+        var(--bg);
+      color: var(--text);
+      font-family: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+    }
+
+    .shell {
+      width: min(1080px, 100%);
+      margin: 0 auto;
+      padding: 24px 18px 48px;
+    }
+
+    header {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-bottom: 20px;
+    }
+
+    .eyebrow {
+      color: var(--gold);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(26px, 5vw, 38px);
+      line-height: 1.1;
+    }
+
+    .subtitle {
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .window-selector,
+    .tabs {
+      display: flex;
+      gap: 8px;
+      overflow-x: auto;
+      padding-bottom: 2px;
+      scrollbar-width: none;
+    }
+
+    .window-selector::-webkit-scrollbar,
+    .tabs::-webkit-scrollbar { display: none; }
+
+    .window-selector { margin: 20px 0 18px; }
+
+    .chip,
+    .tab {
+      flex: 0 0 auto;
+      border: 1px solid var(--border);
+      background: var(--bg-soft);
+      color: var(--muted);
+      border-radius: 999px;
+      padding: 9px 15px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.18s ease;
+    }
+
+    .chip.active,
+    .tab.active {
+      color: #111;
+      background: var(--gold);
+      border-color: var(--gold);
+      box-shadow: 0 6px 20px rgba(212, 175, 55, 0.22);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .card {
+      background: linear-gradient(160deg, var(--panel), var(--panel-2));
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px;
+    }
+
+    .card .label {
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      margin-bottom: 8px;
+    }
+
+    .card .value {
+      font-size: clamp(20px, 4vw, 28px);
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      word-break: break-word;
+    }
+
+    .positive { color: var(--green); }
+    .negative { color: var(--red); }
+    .gold { color: var(--gold); }
+
+    .secondary {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 10px;
+    }
+
+    .mini {
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.015);
+      padding: 12px;
+    }
+
+    .mini span {
+      display: block;
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 5px;
+    }
+
+    .mini strong { font-size: 16px; }
+
+    .tabs {
+      margin: 24px 0 12px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 10px;
+      border-radius: 0;
+    }
+
+    .tab {
+      border-radius: 10px;
+      background: transparent;
+    }
+
+    .operations {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .operation {
+      background: linear-gradient(160deg, var(--panel), var(--panel-2));
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 14px;
+    }
+
+    .operation-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 12px;
+    }
+
+    .market-title {
+      font-size: 15px;
+      font-weight: 700;
+      line-height: 1.3;
+    }
+
+    .operation-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 8px;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 4px 8px;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
+    .badge.long { color: var(--green); border-color: rgba(46, 204, 113, 0.35); background: var(--green-soft); }
+    .badge.short { color: var(--red); border-color: rgba(231, 76, 60, 0.35); background: var(--red-soft); }
+    .badge.open { color: var(--gold); border-color: rgba(212, 175, 55, 0.35); background: var(--gold-soft); }
+    .badge.done { color: var(--muted); }
+    .badge.aligned { color: var(--green); border-color: rgba(46, 204, 113, 0.35); }
+    .badge.conflict { color: var(--red); border-color: rgba(231, 76, 60, 0.35); }
+
+    .operation-numbers {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 12px;
+      padding-top: 12px;
+      border-top: 1px solid var(--border);
+    }
+
+    .operation-numbers span {
+      display: block;
+      color: var(--muted);
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 3px;
+    }
+
+    .operation-numbers strong { font-size: 14px; }
+
+    .empty {
+      border: 1px dashed var(--border);
+      border-radius: 14px;
+      padding: 28px 16px;
+      text-align: center;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    footer {
+      margin-top: 28px;
+      color: #6f6f79;
+      font-size: 11px;
+      text-align: center;
+    }
+
+    @media (min-width: 720px) {
+      .shell { padding: 36px 24px 64px; }
+      .grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+      .secondary { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+      .operations { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .operation-numbers { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <div class="eyebrow">Polymarket AI Bot</div>
+      <h1>Panel de Rendimiento</h1>
+      <p class="subtitle">Métricas de solo lectura desde SQLite. Actualización automática cada 30 segundos.</p>
+    </header>
+
+    <nav class="window-selector" aria-label="Ventana de tiempo">
+      <button class="chip" data-window="24h">24 Horas</button>
+      <button class="chip" data-window="7d">7 Días</button>
+      <button class="chip active" data-window="all">Histórico Total</button>
+    </nav>
+
+    <section class="grid" aria-label="Resumen de rendimiento">
+      <article class="card">
+        <div class="label">PnL Neto</div>
+        <div class="value" id="net-pnl">$0.00</div>
+      </article>
+      <article class="card">
+        <div class="label">Win Rate</div>
+        <div class="value gold" id="win-rate">0.00%</div>
+      </article>
+      <article class="card">
+        <div class="label">Operaciones Cerradas</div>
+        <div class="value" id="closed-count">0</div>
+      </article>
+      <article class="card">
+        <div class="label">Volumen Total</div>
+        <div class="value" id="total-volume">$0.00</div>
+      </article>
+    </section>
+
+    <section class="secondary" aria-label="Detalle de resultados">
+      <div class="mini"><span>Ganadas</span><strong class="positive" id="wins-count">0</strong></div>
+      <div class="mini"><span>Perdidas</span><strong class="negative" id="losses-count">0</strong></div>
+      <div class="mini"><span>Ganancia Bruta</span><strong class="positive" id="gross-profit">$0.00</strong></div>
+      <div class="mini"><span>Pérdida Bruta</span><strong class="negative" id="gross-loss">$0.00</strong></div>
+    </section>
+
+    <nav class="tabs" aria-label="Filtro de operaciones">
+      <button class="tab active" data-tab="all">Todas</button>
+      <button class="tab" data-tab="wins">Ganadas</button>
+      <button class="tab" data-tab="open">En Curso</button>
+    </nav>
+
+    <section class="operations" id="operations" aria-live="polite"></section>
+
+    <footer>Datos calculados desde data/trading_bot.db</footer>
+  </main>
+
+  <script>
+    const state = { window: "all", tab: "all", data: null };
+
+    const money = new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency: "USD",
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    });
+
+    function formatMoney(value) {
+      return money.format(Number(value || 0));
+    }
+
+    function signedClass(value) {
+      const number = Number(value || 0);
+      return number > 0 ? "positive" : number < 0 ? "negative" : "";
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    function sideClass(label) {
+      return label === "Posición Alcista" ? "long" : label === "Posición Bajista" ? "short" : "";
+    }
+
+    function alignmentClass(alignment) {
+      const normalized = String(alignment || "NEUTRAL").toUpperCase();
+      if (normalized === "ALIGNED") return "aligned";
+      if (normalized === "CONFLICT") return "conflict";
+      return "";
+    }
+
+    function renderSummary(data) {
+      const net = document.getElementById("net-pnl");
+      net.textContent = formatMoney(data.net_pnl_usdc);
+      net.className = `value ${signedClass(data.net_pnl_usdc)}`;
+
+      document.getElementById("win-rate").textContent = `${Number(data.win_rate_pct || 0).toFixed(2)}%`;
+      document.getElementById("closed-count").textContent = data.closed_count ?? 0;
+      document.getElementById("total-volume").textContent = formatMoney(data.total_volume_usdc);
+      document.getElementById("wins-count").textContent = data.wins_count ?? 0;
+      document.getElementById("losses-count").textContent = data.losses_count ?? 0;
+      document.getElementById("gross-profit").textContent = formatMoney(data.gross_profit_usdc);
+      document.getElementById("gross-loss").textContent = formatMoney(Math.abs(Number(data.gross_loss_usdc || 0)));
+    }
+
+    function filteredOperations() {
+      const operations = state.data?.operations || [];
+      if (state.tab === "wins") {
+        return operations.filter((op) => op.status === "Concluida" && Number(op.pnl_usdc) > 0);
+      }
+      if (state.tab === "open") {
+        return operations.filter((op) => op.status === "En Curso");
+      }
+      return operations;
+    }
+
+    function renderOperations() {
+      const container = document.getElementById("operations");
+      const operations = filteredOperations();
+
+      if (!operations.length) {
+        container.innerHTML = '<div class="empty">No hay operaciones para este filtro.</div>';
+        return;
+      }
+
+      container.innerHTML = operations
+        .map((op) => {
+          const pnl = Number(op.pnl_usdc || 0);
+          const pnlClass = signedClass(pnl);
+          const statusClass = op.status === "En Curso" ? "open" : "done";
+          return `
+            <article class="operation">
+              <div class="operation-top">
+                <div>
+                  <div class="market-title">${escapeHtml(op.market_title || "Mercado")}</div>
+                  <div class="operation-meta">
+                    <span class="badge ${sideClass(op.side_label)}">${escapeHtml(op.side_label || "Posición")}</span>
+                    <span class="badge ${statusClass}">${escapeHtml(op.status || "")}</span>
+                    <span class="badge">${escapeHtml(op.timeframe || "N/D")}</span>
+                    <span class="badge ${alignmentClass(op.whale_alignment)}">Ballenas: ${escapeHtml(op.whale_alignment || "NEUTRAL")}</span>
+                  </div>
+                </div>
+                <strong class="${pnlClass}">${pnl >= 0 ? "+" : ""}${formatMoney(pnl)}</strong>
+              </div>
+              <div class="operation-numbers">
+                <div><span>PnL</span><strong class="${pnlClass}">${pnl >= 0 ? "+" : ""}${formatMoney(pnl)}</strong></div>
+                <div><span>Stake</span><strong>${formatMoney(op.stake_usdc)}</strong></div>
+                <div><span>Estado</span><strong>${escapeHtml(op.status || "")}</strong></div>
+              </div>
+            </article>
+          `;
+        })
+        .join("");
+    }
+
+    function render() {
+      if (!state.data) return;
+      renderSummary(state.data);
+      renderOperations();
+    }
+
+    async function loadData() {
+      try {
+        const response = await fetch(`/api/performance?window=${encodeURIComponent(state.window)}`, {
+          headers: { Accept: "application/json" },
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        state.data = await response.json();
+        render();
+      } catch (error) {
+        document.getElementById("operations").innerHTML =
+          `<div class="empty">No se pudieron cargar las métricas: ${escapeHtml(error.message)}</div>`;
+      }
+    }
+
+    document.querySelectorAll(".chip").forEach((button) => {
+      button.addEventListener("click", () => {
+        state.window = button.dataset.window;
+        document.querySelectorAll(".chip").forEach((item) => item.classList.toggle("active", item === button));
+        loadData();
+      });
+    });
+
+    document.querySelectorAll(".tab").forEach((button) => {
+      button.addEventListener("click", () => {
+        state.tab = button.dataset.tab;
+        document.querySelectorAll(".tab").forEach((item) => item.classList.toggle("active", item === button));
+        renderOperations();
+      });
+    });
+
+    loadData();
+    setInterval(loadData, 30000);
+  </script>
+</body>
+</html>

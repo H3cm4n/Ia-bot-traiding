@@ -19,37 +19,20 @@ import sqlite3
 import time
 from pathlib import Path
 
+from config import DB_PATH
 from database.db_manager import log_order_event, update_trade_pnl
-
 
 logger = logging.getLogger("paper_executor")
 
-DB_PATH = (
-    Path(__file__).resolve().parent.parent
-    / "data"
-    / "trading_bot.db"
-)
 
-
-# ---------------------------------------------------------------------------
-# Consulta: ¿ya existe una orden activa o liquidada para este mercado/lado?
-#
-# Adaptada al esquema REAL de orders_history (ver is_condition_in_cooldown):
-#     symbol       <- condition_id
-#     side         <- outcome ("YES" / "NO")
-#     action       <- 'PENDING_CREATED' al crear la orden
-#     final_action <- 'WIN' / 'LOSS' / 'STALE' / 'CONFLICT' al cerrar
-#
-# Si tu instalación usa otra tabla/columnas, ajusta únicamente este SQL.
-# ---------------------------------------------------------------------------
+# Consulta SQL robustecida para verificar si un mercado/lado ya se operó
 _MARKET_ALREADY_TRADED_SQL = """
     SELECT COUNT(*)
     FROM orders_history
-    WHERE symbol = ?
-      AND side   = ?
+    WHERE LOWER(symbol) = LOWER(?)
+      AND UPPER(side)   = UPPER(?)
       AND (
-            action = 'PENDING_CREATED'
-         OR final_action IN ('WIN', 'LOSS')
+            action IN ('PENDING_CREATED', 'OPEN', 'PAPER_FILLED', 'WIN', 'LOSS')
       )
 """
 
@@ -73,36 +56,23 @@ class PaperExecutor:
         self.open_trades = {}
         self.trade_history = []
 
-    # ----------------------------------------------------------
-    # Utilidades
-    # ----------------------------------------------------------
-
     @staticmethod
     def _resolve_condition_id(candidate: dict):
-        """Obtiene el condition_id del candidato."""
-
         condition_id = (
             candidate.get("condition_id")
             or candidate.get("conditionId")
             or candidate.get("symbol")
         )
-
         if condition_id is None:
             return None
-
         condition_id = str(condition_id).strip()
-
         return condition_id or None
 
     @staticmethod
     def _resolve_limit_price(candidate: dict):
-        """Obtiene limit_price o, como fallback, price."""
-
         raw_price = candidate.get("limit_price")
-
         if raw_price is None:
             raw_price = candidate.get("price")
-
         try:
             return float(raw_price)
         except (TypeError, ValueError):
@@ -110,13 +80,9 @@ class PaperExecutor:
 
     @staticmethod
     def _resolve_outcome(candidate: dict):
-        """Acepta únicamente los outcomes YES y NO."""
-
         outcome = str(candidate.get("outcome", "")).strip().upper()
-
         if outcome not in {"YES", "NO"}:
             return None
-
         return outcome
 
     def generate_match_key(
@@ -124,15 +90,8 @@ class PaperExecutor:
         condition_id: str,
         outcome: str,
     ) -> str:
-        """Genera una clave única para cada orden simulada."""
-
         timestamp_ns = time.time_ns()
-
         return f"{condition_id}_{outcome}_{timestamp_ns}"
-
-    # ----------------------------------------------------------
-    # Verificación previa en SQLite
-    # ----------------------------------------------------------
 
     def is_market_already_traded(
         self,
@@ -140,18 +99,6 @@ class PaperExecutor:
         outcome: str,
         db_path: str | None = None,
     ) -> bool:
-        """
-        Verifica si ya existe una orden activa ('PENDING_CREATED') o ya
-        liquidada ('WIN'/'LOSS') en orders_history para este
-        condition_id + outcome.
-
-        Devolver True bloquea la creación de una nueva orden, incluso si
-        el proceso se reinició y las órdenes pendientes en memoria se
-        perdieron.
-
-        Fail-safe: si SQLite falla, se devuelve True para no arriesgar
-        duplicados por un error de lectura.
-        """
         if not condition_id or not outcome:
             return False
 
@@ -165,37 +112,27 @@ class PaperExecutor:
                 cursor = conn.cursor()
                 cursor.execute(
                     _MARKET_ALREADY_TRADED_SQL,
-                    (str(condition_id), str(outcome).upper()),
+                    (str(condition_id).strip(), str(outcome).strip().upper()),
                 )
                 row = cursor.fetchone()
-        except sqlite3.Error:
+        except sqlite3.Error as e:
             logger.exception(
-                "Error en is_market_already_traded para %s/%s",
+                "Error en is_market_already_traded para %s/%s: %s",
                 condition_id,
                 outcome,
+                e,
             )
-            # Fail-safe: si no podemos verificar, preferimos no duplicar.
-            return True
+            return True  # Retorna True por seguridad ante fallos de BD (fail-safe)
 
         if not row:
             return False
 
         try:
-            count = int(row[0])
+            return int(row[0]) > 0
         except (TypeError, ValueError):
             return False
 
-        return count > 0
-
-    # ----------------------------------------------------------
-    # Cooldown persistente
-    # ----------------------------------------------------------
-
     def is_condition_in_cooldown(self, condition_id: str) -> bool:
-        """
-        Comprueba si existe un evento reciente para la condición.
-        Soporta timestamps en formato numérico (POSIX) y formato ISO/texto SQLite.
-        """
         if not condition_id or not DB_PATH.exists():
             return False
 
@@ -228,6 +165,7 @@ class PaperExecutor:
             last_trade_time = float(raw_ts)
         except (TypeError, ValueError):
             from datetime import datetime, timezone
+
             try:
                 clean_ts = str(raw_ts).replace("Z", "").replace("T", " ")
                 dt = datetime.strptime(clean_ts.split(".")[0], "%Y-%m-%d %H:%M:%S")
@@ -242,22 +180,11 @@ class PaperExecutor:
         elapsed = time.time() - last_trade_time
         return 0 <= elapsed < self.cooldown_seconds
 
-    # ----------------------------------------------------------
-    # Simulación de consumo de liquidez
-    # ----------------------------------------------------------
-
     def simulate_orderbook_fill(
         self,
         orderbook_asks: list,
         target_size_usdc: float,
     ) -> dict:
-        """
-        Simula una compra recorriendo los niveles de asks.
-
-        Cada nivel debe contener:
-            {"price": "0.45", "size": "100"}
-        """
-
         if not orderbook_asks:
             return {"filled": False, "reason": "EMPTY_ORDERBOOK"}
 
@@ -316,16 +243,7 @@ class PaperExecutor:
             "total_cost_usdc": round(total_cost, 6),
         }
 
-    # ----------------------------------------------------------
-    # Pipeline de candidatos
-    # ----------------------------------------------------------
-
     def execute_candidates(self, candidates: list) -> list:
-        """
-        Procesa candidatos evitando duplicados, mercados activos
-        y operaciones dentro del periodo de cooldown.
-        """
-
         active_conditions = set()
         results = []
 
@@ -390,13 +308,7 @@ class PaperExecutor:
 
         return results
 
-    # ----------------------------------------------------------
-    # Crear y registrar una orden pendiente
-    # ----------------------------------------------------------
-
     def process_signal(self, candidate: dict) -> dict:
-        """Valida, registra y crea una orden exclusivamente simulada."""
-
         condition_id = self._resolve_condition_id(candidate)
 
         if not condition_id:
@@ -414,15 +326,9 @@ class PaperExecutor:
                 "condition_id": condition_id,
             }
 
-        # --- Verificación previa en SQLite -------------------------------
-        # Bloquea duplicados incluso si el proceso se reinició y las
-        # órdenes en memoria se perdieron. Se ejecuta ANTES de validar
-        # precio/tamaño para fallar rápido y no ensuciar logs con
-        # rechazos irrelevantes.
         if self.is_market_already_traded(condition_id, outcome):
             logger.info(
-                "MARKET_ALREADY_TRADED | %s [%s] ya existe en orders_history "
-                "(PENDING_CREATED/WIN/LOSS).",
+                "MARKET_ALREADY_TRADED | %s [%s] ya existe en orders_history.",
                 condition_id,
                 outcome,
             )
@@ -432,7 +338,6 @@ class PaperExecutor:
                 "condition_id": condition_id,
                 "outcome": outcome,
             }
-        # ------------------------------------------------------------------
 
         limit_price = self._resolve_limit_price(candidate)
 
@@ -476,7 +381,6 @@ class PaperExecutor:
             }
 
         match_key = self.generate_match_key(condition_id, outcome)
-
         symbol = str(candidate.get("symbol") or condition_id)
 
         try:
@@ -545,20 +449,12 @@ class PaperExecutor:
             "amount": amount,
         }
 
-    # ----------------------------------------------------------
-    # Sincronización con un resolver externo
-    # ----------------------------------------------------------
-
     def purge_resolved_orders(self, resolved_keys: list):
-        """Elimina órdenes o trades resueltos del estado en memoria."""
-
         for key in resolved_keys:
             self.pending_orders.pop(key, None)
             self.open_trades.pop(key, None)
 
     def cancel_all_pending(self, reason: str = "MANUAL_FLUSH"):
-        """Cancela todas las órdenes pendientes del simulador."""
-
         for key in list(self.pending_orders):
             try:
                 update_trade_pnl(
@@ -575,18 +471,7 @@ class PaperExecutor:
 
             del self.pending_orders[key]
 
-    # ----------------------------------------------------------
-    # Actualizar órdenes pendientes y trades abiertos
-    # ----------------------------------------------------------
-
     def update_orders_and_trades(self, market_snapshot: dict) -> list:
-        """
-        Actualiza órdenes pendientes y trades abiertos a partir
-        de una instantánea de mercado.
-
-        Esta función no envía órdenes reales.
-        """
-
         events = []
 
         # A. Órdenes pendientes

@@ -1,69 +1,188 @@
 """
 services/risk_manager.py
-Módulo de gestión de riesgos para validar límites de capital, tamaño de orden y liquidez en libro.
+Gestión de riesgo centralizada y Sizing Dinámico con Criterio de Kelly Fraccionado (1/4 Kelly).
 """
 
-import sys
-import requests
+import os
+import sqlite3
+import logging
+from pathlib import Path
+from typing import Tuple, Optional, Dict, Any
 
+from config import (
+    DB_PATH,
+    DEFAULT_ORDER_AMOUNT_USDC,
+    MAX_PENDING_ORDERS,
+)
+
+logger = logging.getLogger("risk_manager")
+
+# Configuración de Riesgo por Defecto
+MAX_RISK_USD = float(os.getenv("MAX_RISK_USD", 15.0))
+MIN_EXECUTABLE_PRICE = 0.12
+MAX_EXECUTABLE_PRICE = 0.58
 
 class RiskManager:
-    def __init__(self, max_position_pct=0.05, max_order_usd=50.0, min_depth_usd=10.0):
-        self.max_position_pct = max_position_pct
-        self.max_order_usd = max_order_usd
-        self.min_depth_usd = min_depth_usd  # Mínimo de liquidez requerida en el libro
-        self.clob_book_url = "https://clob.polymarket.com/book"
+    def __init__(
+        self,
+        initial_capital_usdc: float = 1000.0,
+        max_daily_loss_usdc: float = 100.0,
+        max_portfolio_exposure_pct: float = 0.25, # Máximo 25% de capital en juego
+        kelly_fraction: float = 0.25,             # 1/4 Kelly
+        min_trade_pct: float = 0.02,              # Piso 2%
+        max_trade_pct: float = 0.10,              # Techo 10%
+    ):
+        self.initial_capital_usdc = initial_capital_usdc
+        self.max_daily_loss_usdc = max_daily_loss_usdc
+        self.max_portfolio_exposure_pct = max_portfolio_exposure_pct
+        self.kelly_fraction = kelly_fraction
+        self.min_trade_pct = min_trade_pct
+        self.max_trade_pct = max_trade_pct
 
-    def check_orderbook_depth(self, token_id: str, side: str, required_size: float) -> tuple:
-        """
-        Consulta el libro de órdenes del CLOB de Polymarket y verifica si hay liquidez suficiente.
-        """
-        if not token_id or token_id == "N/A":
-            return True, "SKIPPED_NO_TOKEN"
+    def get_current_balance(self) -> float:
+        """Calcula el balance vivo sumando PnL realizado al capital inicial."""
+        if not DB_PATH.exists():
+            return self.initial_capital_usdc
 
         try:
-            params = {"token_id": token_id}
-            res = requests.get(self.clob_book_url, params=params, timeout=5)
-            if res.status_code == 200:
-                book = res.json()
-                # Para comprar (BUY/YES) revisamos ASKS; para vender revisamos BIDS
-                orders = book.get("asks", []) if side.upper() in ["BUY", "YES"] else book.get("bids", [])
-                
-                total_available_size = sum(float(o.get("size", 0)) for o in orders[:5])
-                
-                if total_available_size < required_size:
-                    return False, f"INSUFFICIENT_DEPTH (Disponible: {total_available_size:.2f}, Requerido: {required_size:.2f})"
-                return True, "DEPTH_OK"
+            with sqlite3.connect(DB_PATH) as conn:
+                cursor = conn.cursor()
+                # En orders_history la columna es 'pnl' y las acciones relevantes son 'CLOSED' o 'EXIT'
+                cursor.execute("SELECT SUM(pnl) FROM orders_history WHERE action IN ('CLOSED', 'EXIT', 'WIN', 'LOSS')")
+                row = cursor.fetchone()
+                realized_pnl = row[0] if row and row[0] is not None else 0.0
+                return max(100.0, self.initial_capital_usdc + realized_pnl)
         except Exception as e:
-            # Si falla la llamada por timeout o red, se permite el paso con aviso
-            return True, f"DEPTH_CHECK_WARNING ({e})"
+            logger.warning(f"Error calculating balance: {e}")
+            return self.initial_capital_usdc
 
-        return True, "DEPTH_OK"
+    def get_active_exposure(self) -> float:
+        """Calcula el capital actualmente comprometido en posiciones abiertas."""
+        if not DB_PATH.exists():
+            return 0.0
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                cursor = conn.cursor()
+                # Usamos price y amount de orders_history. amount es USD.
+                cursor.execute("""
+                    SELECT SUM(amount) FROM orders_history o
+                    WHERE action IN ('ENTRY', 'FILL', 'PENDING_CREATED', 'PAPER_FILLED')
+                    AND NOT EXISTS (
+                        SELECT 1 FROM orders_history 
+                        WHERE match_key = o.match_key AND action IN ('CLOSED', 'EXIT', 'WIN', 'LOSS', 'CANCELED')
+                    )
+                """)
+                row = cursor.fetchone()
+                return row[0] if row and row[0] is not None else 0.0
+        except Exception as e:
+            logger.warning(f"Error calculating exposure: {e}")
+            return 0.0
 
-    def validate_trade(self, signal: dict, balance_usd: float = 1000.0) -> tuple:
+    def has_open_position(self, market_id_or_key: str) -> bool:
+        """Indica si ya existe una posición abierta para ese mercado."""
+        if not DB_PATH.exists():
+            return False
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT 1 FROM orders_history o
+                    WHERE match_key = ? 
+                    AND action IN ('ENTRY', 'FILL', 'PENDING_CREATED', 'PAPER_FILLED')
+                    AND NOT EXISTS (
+                        SELECT 1 FROM orders_history 
+                        WHERE match_key = o.match_key AND action IN ('CLOSED', 'EXIT', 'CANCELED', 'WIN', 'LOSS')
+                    )
+                    LIMIT 1
+                """, (str(market_id_or_key),))
+                return cursor.fetchone() is not None
+        except Exception:
+            return False
+
+    def calculate_risk_based_size(self, entry_price: float) -> float:
         """
-        Valida las reglas de riesgo operacionales y la profundidad del libro de órdenes.
+        Calcula el tamaño de la posición en USD para que el riesgo sea MAX_RISK_USD.
+        Si compramos 'shares' a 'entry_price', el costo (y pérdida máxima) es shares * entry_price.
+        Queremos shares * entry_price = MAX_RISK_USD => shares = MAX_RISK_USD / entry_price.
+        El monto a invertir en USD es MAX_RISK_USD.
         """
-        price = float(signal.get("price", 0.0))
-        size = float(signal.get("size", 0.0))
-        token_id = signal.get("token_id", "N/A")
-        outcome = signal.get("outcome", "YES")
+        if entry_price <= 0:
+            return 0.0
+        
+        # El usuario pide calcular acciones como round(MAX_RISK_USD / entry_price, 2)
+        # Pero el bot opera en USD (amount), así que invertimos MAX_RISK_USD.
+        # Esto garantiza que si el contrato va a 0, perdemos exactamente MAX_RISK_USD.
+        return round(MAX_RISK_USD, 2)
 
-        amount_usd = signal.get("amount_usd", price * size)
+    def calculate_fractional_kelly_size(
+        self, fair_prob: float, price: float, available_capital: Optional[float] = None
+    ) -> float:
+        """
+        Calcula el monto en USDC aplicando 1/4 Kelly con cotas [2%, 10%].
+        Ahora también limitado por MAX_RISK_USD.
+        """
+        balance = available_capital if available_capital is not None else self.get_current_balance()
+        
+        if price <= 0 or price >= 1.0 or fair_prob <= price:
+            return 0.0
 
-        # 1. Regla: Tamaño máximo por orden individual
-        if amount_usd > self.max_order_usd:
-            return False, f"EXCEEDS_MAX_ORDER_USD (${amount_usd:.2f} > ${self.max_order_usd:.2f})"
+        b = (1.0 - price) / price  # Odds netas (Decimal)
+        p = fair_prob
+        q = 1.0 - p
 
-        # 2. Regla: Porcentaje máximo del balance del portafolio
-        max_allowed_usd = balance_usd * self.max_position_pct
-        if amount_usd > max_allowed_usd:
-            return False, f"EXCEEDS_PORTFOLIO_LIMIT (${amount_usd:.2f} > ${max_allowed_usd:.2f})"
+        # Kelly Full: f = (bp - q) / b
+        full_kelly = (b * p - q) / b
+        if full_kelly <= 0:
+            return 0.0
 
-        # 3. Regla: Verificación de profundidad del libro (Orderbook Depth)
-        if token_id != "N/A":
-            depth_ok, depth_reason = self.check_orderbook_depth(token_id, outcome, size)
-            if not depth_ok:
-                return False, depth_reason
+        # Kelly Fraccional (25%)
+        target_fraction = full_kelly * self.kelly_fraction
+        
+        # Aplicar límites [2%, 10%] del balance actual
+        final_fraction = max(self.min_trade_pct, min(self.max_trade_pct, target_fraction))
+        
+        position_usd = balance * final_fraction
 
-        return True, "PASSED"
+        # CAP por Riesgo Máximo USD
+        position_usd = min(position_usd, MAX_RISK_USD)
+
+        # Verificar si excede la exposición total de cartera (25%)
+        active_exposure = self.get_active_exposure()
+        remaining_portfolio_space = (balance * self.max_portfolio_exposure_pct) - active_exposure
+        
+        final_size = min(position_usd, remaining_portfolio_space)
+        
+        return round(max(0.0, final_size), 2)
+
+    def is_kill_switch_active(self) -> bool:
+        """Verifica si la pérdida diaria acumulada cruzó el tope."""
+        if not DB_PATH.exists():
+            return False
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT SUM(pnl) FROM orders_history
+                    WHERE date(timestamp) = date('now') AND pnl < 0
+                """)
+                row = cursor.fetchone()
+                daily_loss = abs(row[0]) if row and row[0] is not None else 0.0
+                return daily_loss >= self.max_daily_loss_usdc
+        except Exception:
+            return False
+
+    def validate_trade(self, fair_prob: float, price: float) -> Tuple[bool, str, float]:
+        """Validación integral antes de disparar."""
+        if self.is_kill_switch_active():
+            return False, "KILL_SWITCH_ACTIVE", 0.0
+
+        if price < MIN_EXECUTABLE_PRICE or price > MAX_EXECUTABLE_PRICE:
+            return False, "PRICE_OUT_OF_ASYMMETRIC_RANGE", 0.0
+
+        # Usamos Kelly pero capeado por MAX_RISK_USD (implementado en calculate_fractional_kelly_size)
+        size = self.calculate_fractional_kelly_size(fair_prob, price)
+        
+        if size < 5.0: # Monto mínimo operativo para evitar polvo (dust)
+            return False, "SIZE_TOO_SMALL", size
+
+        return True, "PASSED", size

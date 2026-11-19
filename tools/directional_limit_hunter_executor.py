@@ -1,322 +1,308 @@
 """
 tools/directional_limit_hunter_executor.py
-Ejecutor de órdenes v2.1 con integración del filtro por EV_net, tope de precio
-ejecutable (asimetría favorable), registro de rechazados, inferencia dinámica ML
-y deduplicación previa contra SQLite (markets ya operados).
+Ejecutor v3.0 Integrado: Discovery -> Fair Value -> Manipulation Guard -> Kelly Risk -> Paper Execution.
 """
-import os
+
 import sys
 import json
 import logging
 from pathlib import Path
-from typing import Optional
+from datetime import datetime, timezone
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from services.market_resolver import MarketResolver
+from services.crypto_universe_discovery import CryptoUniverseDiscovery
 from services.clob_client import PolymarketCLOBClient
-from services.realistic_entry_filter import RealisticEntryFilter
+from models.market_manipulation_guard import MarketManipulationGuard
+from models.crypto_fair_value import calculate_time_aware_fair_value, evaluate_updown_fair_value
+from services.risk_manager import RiskManager, MAX_RISK_USD
+from services.whale_tracker import WhaleTracker
+from services.telegram_notifier import TelegramNotifier
 from executors.paper_executor import PaperExecutor
-from database.db_manager import (
-    log_order_event,
-    log_rejected_candidate,
-)
-from connectors.polymarket_ingest import fetch_diversified_markets
-from models.predictive_filter import evaluate_candidate, DEFAULT_FAIR_PROB
+from database.db_manager import log_order_event, log_rejected_candidate, log_whale_comparison
 
-logger = logging.getLogger("directional_executor")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("full_integration")
 
-SIDE_SUFFIX = " [LADO NO]"
-
-# --- Rango de precio ejecutable (asimetría favorable) ---
-MAX_ENTRY_PRICE = 0.55
-MIN_ENTRY_PRICE = 0.15
-
-# Fallback conservador si el modelo ML no puede predecir
-DEFAULT_FAIR_PROBABILITY = 0.50
-
-# --- Ruta única de la DB (coherente con el runner y con db_manager) ---
-DIRECTIONAL_DB_PATH = os.environ.get(
-    "DIRECTIONAL_DB_PATH",
-    str(PROJECT_ROOT / "database" / "trading.db"),
-)
+def get_candle_open(guard, symbol, interval="1h"):
+    """Obtiene el precio de apertura de la vela actual en Binance."""
+    klines = guard.get_binance_klines(symbol, interval=interval, limit=1)
+    if klines:
+        return float(klines[0][1]) # El índice 1 es Open price
+    return 0.0
 
 
-# ---------------------------------------------------------------------------
-# Modelo ML: carga perezosa y singleton
-# ---------------------------------------------------------------------------
-_ML_PREDICTOR = None
-_ML_PREDICTOR_FAILED = False
+def decide_whale_adjustment(
+    tracker,
+    side,
+    condition_net_flow_usd,
+    asset_net_flow_usd,
+    size_usd,
+    max_risk_usd=MAX_RISK_USD,
+):
+    """
+    Resuelve el ajuste de tamaño por ballenas.
 
+    El flujo del condition_id exacto puede habilitar el boost ALIGNED (1.25x).
+    El flujo agregado por activo solo puede vetar o reducir el tamaño, nunca
+    incrementarlo, para evitar que trades de otros strikes inflen la posición.
+    """
+    condition_adj = tracker.evaluate_whale_alignment(
+        side, condition_net_flow_usd, size_usd, max_risk_usd
+    )
+    asset_adj = tracker.evaluate_whale_alignment(
+        side, asset_net_flow_usd, size_usd, max_risk_usd
+    )
 
-def _get_ml_predictor():
-    global _ML_PREDICTOR, _ML_PREDICTOR_FAILED
+    if asset_adj["rejected"]:
+        return asset_adj, "asset"
+    if condition_adj["rejected"]:
+        return condition_adj, "condition"
 
-    if _ML_PREDICTOR is not None:
-        return _ML_PREDICTOR
-    if _ML_PREDICTOR_FAILED:
-        return None
+    conflicts = [
+        adj
+        for adj in (asset_adj, condition_adj)
+        if adj["whale_alignment"] == "CONFLICT"
+    ]
+    if conflicts:
+        chosen = min(conflicts, key=lambda adj: adj["same_side_flow_usd"])
+        return chosen, "asset" if chosen is asset_adj else "condition"
 
-    try:
-        _ML_PREDICTOR = evaluate_candidate
-        logger.info("[ML] Predictor cuantitativo time-aware cargado correctamente.")
-        return _ML_PREDICTOR
-    except Exception as e:
-        logger.error(f"[ML] No se pudo cargar el predictor: {e}")
-        _ML_PREDICTOR_FAILED = True
-        return None
+    if condition_adj["whale_alignment"] == "ALIGNED":
+        return condition_adj, "condition"
 
+    if condition_adj["same_side_flow_usd"] != 0:
+        return condition_adj, "condition"
 
-def _resolve_fair_probability(cand: dict) -> tuple[float, str]:
-    """Devuelve (fair_probability, source)."""
-    if "fair_probability" in cand and cand["fair_probability"] is not None:
-        return float(cand["fair_probability"]), "candidate"
+    neutral = {
+        "size_usd": round(size_usd, 2),
+        "whale_alignment": "NEUTRAL",
+        "action_taken": "PROCEED",
+        "rejected": False,
+        "same_side_flow_usd": round(asset_adj["same_side_flow_usd"], 2),
+    }
+    return neutral, "asset"
 
-    try:
-        _, _, metrics = evaluate_candidate(cand)
-        fair_prob = metrics.get("fair_prob", DEFAULT_FAIR_PROB)
-        return float(fair_prob), "predictive_filter"
-    except Exception as e:
-        logger.error(f"[ML] Error evaluando candidato con predictive_filter: {e}")
-        return DEFAULT_FAIR_PROB, "default"
-
-
-# ---------------------------------------------------------------------------
-# Resolución de mercado
-# ---------------------------------------------------------------------------
-def _norm_question(text) -> str:
-    return str(text or "").replace(SIDE_SUFFIX, "").strip().lower()
-
-
-def resolve_market_for_candidate(candidate: dict, live_markets: list) -> Optional[dict]:
-    cid = candidate.get("condition_id")
-
-    if cid and live_markets:
-        for m in live_markets:
-            m_cid = m.get("condition_id") or m.get("conditionId")
-            if m_cid and str(cid).lower() == str(m_cid).lower():
-                return m
-
-    question = _norm_question(candidate.get("question"))
-    if question and live_markets:
-        for m in live_markets:
-            m_q = _norm_question(m.get("question"))
-            if m_q and m_q == question:
-                return m
-
-    return None
-
-
-def _as_list(value):
-    if isinstance(value, str):
-        try:
-            return json.loads(value)
-        except json.JSONDecodeError:
-            return None
-    return value
-
-
-def _extract_token_id(market: dict, outcome: str) -> Optional[str]:
-    outcomes = _as_list(market.get("outcomes"))
-    token_ids = _as_list(market.get("clobTokenIds") or market.get("clob_token_ids"))
-    if not outcomes or not token_ids:
-        return None
-    for name, tid in zip(outcomes, token_ids):
-        if str(name).upper() == outcome:
-            return tid
-    return None
-
-
-def _load_live_markets(resolver) -> list:
-    try:
-        events = fetch_diversified_markets(limit=100)
-        markets = []
-        for ev in events or []:
-            markets.extend(ev.get("markets", []) or [])
-        return markets
-    except Exception as e:
-        logger.error(f"No se pudieron cargar mercados en vivo desde Gamma: {e}")
-        return []
-
-
-# ---------------------------------------------------------------------------
-# Procesamiento del snapshot
-# ---------------------------------------------------------------------------
-def process_snapshot(candidates_data: list) -> list:
-    resolver = MarketResolver()
+def run_e2e_cycle():
+    discovery = CryptoUniverseDiscovery()
     clob = PolymarketCLOBClient()
-    entry_filter = RealisticEntryFilter(min_edge_margin=0.02)
-    executor = PaperExecutor(max_pending_orders=20)
+    guard = MarketManipulationGuard()
+    risk = RiskManager()
+    whale_tracker = WhaleTracker()
+    notifier = TelegramNotifier()
+    # Aumentar max_pending_orders a 15 para permitir que RiskManager gestione la exposición
+    executor = PaperExecutor(max_pending_orders=15)
 
-    live_markets = _load_live_markets(resolver)
+    logger.info("=== INICIANDO CICLO E2E (DIRECCIONAL V3.2) ===")
 
-    ml_predictor = _get_ml_predictor()
-    if ml_predictor is None:
-        logger.warning(
-            "[ML] Ejecutando sin inferencia dinámica; "
-            "se usarán fair_probability del candidato o default."
-        )
+    markets = discovery.discover_updown_markets()
+    logger.info(f"Descubiertos {len(markets)} mercados candidatos.")
 
-    approved_candidates = []
-    results = []
+    for m in markets:
+        symbol = m["symbol"]
+        condition_id = m["condition_id"]
+        question = m["question"]
+        q_upper = question.upper()
+        
+        # 1. Validación de Strike / Dirección
+        if not m["is_updown"] and m["strike_price"] is None:
+            continue
 
-    for cand in candidates_data:
-        symbol = cand.get("symbol", cand.get("question", "CRYPTO"))
+        # 2. Consultar Precios Spot y Apertura
+        current_spot = guard.get_binance_price(symbol)
+        if current_spot <= 0:
+            continue
 
-        default_outcome = "NO" if SIDE_SUFFIX in str(cand.get("question", "")) else "YES"
-        outcome = str(cand.get("outcome", default_outcome)).upper()
+        # 3. Cálculo de Probabilidad Justa (Fair Value)
+        try:
+            end_ts = datetime.fromisoformat(m["end_date"].replace("Z", "+00:00"))
+            seconds_left = (end_ts - datetime.now(timezone.utc)).total_seconds()
+            days_left = max(0.0001, seconds_left / (24 * 3600))
+        except Exception:
+            days_left = 1.0
 
-        # 1. Resolver mercado
-        market = resolve_market_for_candidate(cand, live_markets)
-
-        if market:
-            cond_id = market.get("condition_id") or market.get("conditionId")
-            token_id = _extract_token_id(market, outcome)
+        if m["is_updown"]:
+            interval = "1h" if "HOURLY" in q_upper or days_left < 1 else "1d"
+            open_price = get_candle_open(guard, symbol, interval)
+            if open_price <= 0:
+                open_price = current_spot
+            fair_res = evaluate_updown_fair_value(symbol, current_spot, open_price, minutes_left=days_left * 24 * 60)
+            fair_prob_yes = fair_res["fair_prob_yes"]
+            fair_prob_no = fair_res["fair_prob_no"]
         else:
-            tokens = resolver.get_market_tokens(symbol)
-            cond_id = tokens.get("condition_id") if tokens else cand.get("condition_id")
-            token_id = tokens.get(outcome) if tokens else None
+            pair = symbol.upper() if symbol.upper().endswith("USDT") else f"{symbol.upper()}USDT"
+            prob_above = calculate_time_aware_fair_value(current_spot, m["strike_price"], days_left, symbol=pair)
+            is_bearish = any(w in q_upper for w in ["DIP", "BELOW", "UNDER", "DROP", "FALL"])
+            fair_prob_yes = (1.0 - prob_above) if is_bearish else prob_above
+            fair_prob_no = 1.0 - fair_prob_yes
 
-        if not cond_id:
-            logger.warning(f"Sin condition_id para '{symbol}', se omite")
-            results.append({"status": "REJECTED", "reason": "MARKET_NOT_RESOLVED", "symbol": symbol})
+        # 4. Evaluación Bidireccional de Orderbooks
+        outcomes_to_eval = [
+            {"side": "YES", "token_id": m["token_id_yes"], "fair_prob": fair_prob_yes},
+            {"side": "NO", "token_id": m["token_id_no"], "fair_prob": fair_prob_no},
+        ]
+
+        best_outcome = None
+        max_edge = -1.0
+
+        for out in outcomes_to_eval:
+            try:
+                book = clob.get_order_book(out["token_id"])
+                asks = book.get("asks", [])
+                bids = book.get("bids", [])
+                if not asks or not bids:
+                    continue
+                best_ask = min(float(a["price"]) for a in asks)
+                if best_ask < 0.05 or best_ask > 0.90:
+                    continue
+                edge = out["fair_prob"] - best_ask
+                if edge > max_edge:
+                    max_edge = edge
+                    best_outcome = {
+                        "side": out["side"],
+                        "token_id": out["token_id"],
+                        "price": best_ask,
+                        "fair_prob": out["fair_prob"],
+                        "asks": asks,
+                        "bids": bids,
+                        "edge": edge,
+                    }
+            except Exception:
+                continue
+
+        if not best_outcome or best_outcome["edge"] <= 0:
             continue
 
-        cand["condition_id"] = cond_id
-        cand["token_id"] = token_id
-        cand["outcome"] = outcome
-
-        # --- 1.a. Deduplicación previa contra SQLite ------------------------
-        # Se descarta el candidato si (cond_id, outcome) ya tiene una orden
-        # activa ('PENDING_CREATED') o ya liquidada ('WIN'/'LOSS'). Se ejecuta
-        # ANTES de la inferencia ML y del filtro de precio para ahorrar
-        # cómputo, llamadas a CLOB y escritura de rechazados.
-        if executor.is_market_already_traded(cond_id, outcome, DIRECTIONAL_DB_PATH):
-            logger.info(
-                f"[DEDUP] Mercado {cond_id} [{outcome}] ya tiene orden registrada. Se omite."
-            )
-            results.append({
-                "status": "REJECTED",
-                "reason": "MARKET_ALREADY_TRADED",
-                "condition_id": cond_id,
-                "outcome": outcome,
-            })
+        # 5. Risk Management & Kelly Sizing
+        if risk.has_open_position(condition_id):
             continue
-        # --------------------------------------------------------------------
 
-        executable_price = cand.get("limit_price", cand.get("price", 0.50))
+        is_valid, reason, size_usd = risk.validate_trade(best_outcome["fair_prob"], best_outcome["price"])
+        if not is_valid:
+            if reason != "HAS_OPEN_POSITION":
+                logger.info(f"[RISK] Candidato {symbol} rechazado: {reason}")
+            continue
 
-        # --- Inferencia dinámica de fair_probability ---
-        fair_probability, prob_source = _resolve_fair_probability(cand)
-        cand["fair_probability"] = fair_probability
-        cand["fair_probability_source"] = prob_source
-
+        size_usd = round(size_usd, 2)
         logger.info(
-            f"[ML] Prob para {cond_id} [{outcome}]: "
-            f"{fair_probability:.4f} (origen={prob_source})"
+            f"Evaluando {symbol} [{best_outcome['side']}]: Price={best_outcome['price']:.3f}, "
+            f"Fair={best_outcome['fair_prob']:.3f}, Edge={best_outcome['edge']:.3f}, Size=${size_usd:.2f}"
+        )
+        # 6. Market Manipulation Guard (sobre el lado elegido)
+        guard_res = guard.evaluate(
+            symbol=symbol,
+            condition_id=condition_id,
+            asks=best_outcome["asks"],
+            bids=best_outcome["bids"],
+            poly_price=best_outcome["price"],
+            order_size_usd=size_usd
         )
 
-        # --- 1.b. Filtro de rango de precio ejecutable ---
-        if not (MIN_ENTRY_PRICE <= executable_price <= MAX_ENTRY_PRICE):
-            reason = "OUT_OF_BOUNDS_PRICE"
-            match_key = f"{cond_id}_{outcome}"
-
-            logger.warning(
-                f"[PRICE-FILTER] CANDIDATO RECHAZADO: {cond_id} [{outcome}] | "
-                f"Precio: {executable_price:.4f} fuera de rango "
-                f"[{MIN_ENTRY_PRICE:.2f}, {MAX_ENTRY_PRICE:.2f}] | "
-                f"Prob: {fair_probability:.4f} ({prob_source}) | Razón: {reason}"
-            )
-
-            log_rejected_candidate(
-                match_key=match_key,
-                reason=reason,
-                fair_probability=fair_probability,
-                executable_price=executable_price,
-                edge=0.0,
-                raw_data=cand,
-            )
-            results.append({
-                "status": "REJECTED",
-                "reason": reason,
-                "condition_id": cond_id,
-                "outcome": outcome,
-                "executable_price": executable_price,
-                "min_entry_price": MIN_ENTRY_PRICE,
-                "max_entry_price": MAX_ENTRY_PRICE,
-                "fair_probability_source": prob_source,
-            })
+        if guard_res["status"] != "SAFE_TO_TRADE":
+            logger.warning(f"[GUARD] Veto para {symbol} [{best_outcome['side']}]: {guard_res['status']} - {guard_res['reasons']}")
             continue
 
-        # 2. Libro CLOB en vivo
-        if token_id:
-            book = clob.get_order_book(token_id)
-            cand["orderbook_asks"] = book.get("asks", [])
-            cand["orderbook_bids"] = book.get("bids", [])
+        # 6.5 Whale Integration
+        side = best_outcome["side"]
+        condition_whale_data = whale_tracker.get_whale_activity(condition_id)
+        asset_whale_data = whale_tracker.get_asset_whale_activity(symbol)
 
-        # 3. Evaluación de Expectativa Neta (EV_net)
-        eval_res = entry_filter.evaluate_opportunity(
-            fair_probability=fair_probability,
-            executable_price=executable_price,
-            spread=0.01,
-            slippage=0.005,
+        whale_adj, whale_source = decide_whale_adjustment(
+            whale_tracker,
+            side,
+            condition_whale_data["whale_net_flow_usd"],
+            asset_whale_data["whale_net_flow_usd"],
+            size_usd,
+            MAX_RISK_USD,
+        )
+        whale_data = condition_whale_data if whale_source == "condition" else asset_whale_data
+        whale_alignment = whale_adj["whale_alignment"]
+        action_taken = whale_adj["action_taken"]
+
+        if whale_adj["rejected"]:
+            logger.warning(f"[WHALE] {symbol} rechazado por fuerte oposición de ballenas: {whale_adj['same_side_flow_usd']}")
+            log_whale_comparison(
+                condition_id=condition_id,
+                symbol=symbol,
+                bot_side=side,
+                bot_fair_prob=best_outcome["fair_prob"],
+                market_price=best_outcome["price"],
+                whale_yes_usd=whale_data["whale_yes_usd"],
+                whale_no_usd=whale_data["whale_no_usd"],
+                whale_consensus=whale_data["whale_consensus"],
+                whale_alignment=whale_alignment,
+                action_taken=whale_alignment
+            )
+            continue
+
+        size_usd = whale_adj["size_usd"]
+        size_usd = round(size_usd, 2)
+        print(f"[WHALE-CMP] {symbol} [{side}] | Bot Fair: {best_outcome['fair_prob']:.3f} vs Ask: {best_outcome['price']:.3f} | Whales: YES=${whale_data['whale_yes_usd']:.0f} NO=${whale_data['whale_no_usd']:.0f} ({whale_alignment})")
+        
+        log_whale_comparison(
+            condition_id=condition_id,
+            symbol=symbol,
+            bot_side=side,
+            bot_fair_prob=best_outcome["fair_prob"],
+            market_price=best_outcome["price"],
+            whale_yes_usd=whale_data["whale_yes_usd"],
+            whale_no_usd=whale_data["whale_no_usd"],
+            whale_consensus=whale_data["whale_consensus"],
+            whale_alignment=whale_alignment,
+            action_taken=action_taken
         )
 
-        match_key = f"{cond_id}_{outcome}"
-        edge_val = eval_res.get("edge", 0.0)
+        # 7. Ejecución (Paper Trading)
+        logger.info(f"[EXECUTION] Disparando orden en {symbol} [{best_outcome['side']}] por ${size_usd:.2f}")
+        
+        order_payload = [{
+            "symbol": symbol,
+            "condition_id": condition_id,
+            "token_id": best_outcome["token_id"],
+            "outcome": best_outcome["side"],
+            "price": best_outcome["price"],
+            "amount": size_usd,
+            "target_size_usdc": size_usd,
+            "fair_probability": best_outcome["fair_prob"],
+            "question": question
+        }]
 
-        if not eval_res["approved"]:
-            reason = eval_res["reason"]
+        
+        results = executor.execute_candidates(order_payload)
+        logger.info(f"Resultado ejecución: {json.dumps(results, indent=2)}")
 
-            logger.warning(
-                f"[ML-FILTER] CANDIDATO RECHAZADO: {cond_id} [{outcome}] | "
-                f"EV: {edge_val:+.4f} | Prob: {fair_probability:.4f} ({prob_source}) | "
-                f"Precio: {executable_price:.2f} | Razón: {reason}"
+        for result in results:
+            if result.get("status") not in ("PENDING_CREATED", "FILLED", "PAPER_FILLED"):
+                continue
+
+            entry_price = float(result.get("limit_price", best_outcome["price"]))
+            entry_amount = float(result.get("amount", size_usd))
+            potential_return = (
+                entry_amount * (1.0 - entry_price) / entry_price
+                if entry_price > 0
+                else 0.0
             )
 
-            log_rejected_candidate(
-                match_key=match_key,
-                reason=reason,
-                fair_probability=fair_probability,
-                executable_price=executable_price,
-                edge=edge_val,
-                raw_data=cand,
+            notifier.notify_order_placed(
+                {
+                    **order_payload[0],
+                    **result,
+                    "symbol": symbol,
+                    "outcome": best_outcome["side"],
+                    "price": entry_price,
+                    "limit_price": entry_price,
+                    "amount": entry_amount,
+                    "fair_probability": best_outcome["fair_prob"],
+                    "potential_return": round(potential_return, 2),
+                    "whale_alignment": whale_alignment,
+                    "whale_yes_usd": whale_data["whale_yes_usd"],
+                    "whale_no_usd": whale_data["whale_no_usd"],
+                    "whale_net_flow_usd": whale_data["whale_net_flow_usd"],
+                }
             )
-            results.append({
-                "status": "REJECTED",
-                "reason": reason,
-                "condition_id": cond_id,
-                "outcome": outcome,
-                "fair_probability_source": prob_source,
-            })
-        else:
-            logger.info(
-                f"[ML-FILTER] CANDIDATO APROBADO: {cond_id} [{outcome}] | "
-                f"EV: {edge_val:+.4f} | Prob: {fair_probability:.4f} ({prob_source}) | "
-                f"Precio: {executable_price:.2f}"
-            )
-            approved_candidates.append(cand)
-
-    # 4. Ejecutar solo los candidatos aprobados
-    if approved_candidates:
-        logger.info(f"[EJECUCIÓN] Enviando {len(approved_candidates)} candidatos aprobados al PaperExecutor...")
-        exec_results = executor.execute_candidates(approved_candidates)
-        results.extend(exec_results)
-    else:
-        logger.info("[FILTROS] Todos los candidatos de este snapshot fueron descartados.")
-
-    return results
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    try:
-        raw_input = sys.stdin.read()
-        if raw_input.strip():
-            data = json.loads(raw_input)
-            res = process_snapshot(data)
-            print(json.dumps(res, indent=2))
-    except Exception as e:
-        logger.error(f"Error en ejecutor directional v2.1: {e}")
+    run_e2e_cycle()

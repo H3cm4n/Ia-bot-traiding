@@ -9,7 +9,7 @@ import logging
 
 from connectors.polymarket_ingest import get_live_snapshot
 from models.predictive_filter import filter_snapshot
-from tools.directional_limit_hunter_executor import process_snapshot, executor
+from tools.directional_limit_hunter_executor import process_snapshot
 from services.order_settlement_resolver import check_and_settle_orders
 from models.train_filter import train_model
 from analytics.performance import calculate_metrics
