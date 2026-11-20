@@ -24,7 +24,7 @@ def isolated_risk_manager(tmp_path, monkeypatch):
     return RiskManager(initial_capital_usdc=1000.0)
 
 
-@pytest.mark.parametrize("price", [0.0, 0.05, 0.08, 0.119, 0.581, 0.60, 0.75, 1.0])
+@pytest.mark.parametrize("price", [0.0, 0.05, 0.08, 0.119, 0.149, 0.401, 0.41, 0.50, 0.58, 0.75, 1.0])
 def test_risk_manager_rejects_price_outside_asymmetric_range(isolated_risk_manager, price):
     is_valid, reason, size = isolated_risk_manager.validate_trade(fair_prob=0.9, price=price)
 
@@ -34,10 +34,16 @@ def test_risk_manager_rejects_price_outside_asymmetric_range(isolated_risk_manag
 
 
 def test_risk_manager_accepts_price_at_range_boundaries(isolated_risk_manager):
-    for price in (0.12, 0.58):
+    for price in (0.15, 0.40):
         is_valid, reason, size = isolated_risk_manager.validate_trade(fair_prob=0.9, price=price)
         assert is_valid is True, reason
         assert size <= risk_module.MAX_RISK_USD
+
+
+def test_risk_manager_asymmetric_max_price_is_040_and_min_is_015():
+    assert risk_module.MIN_EXECUTABLE_PRICE == pytest.approx(0.15)
+    assert risk_module.MAX_EXECUTABLE_PRICE == pytest.approx(0.40)
+    assert (1.0 - risk_module.MAX_EXECUTABLE_PRICE) / risk_module.MAX_EXECUTABLE_PRICE == pytest.approx(1.5)
 
 
 def test_risk_manager_caps_size_at_max_risk_usd(isolated_risk_manager):

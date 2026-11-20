@@ -9,7 +9,13 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 import services.risk_manager as risk_module
-from services.crypto_universe_discovery import CryptoUniverseDiscovery
+from config import MIN_MARKET_DURATION_MINUTES
+from services.crypto_universe_discovery import (
+    CryptoUniverseDiscovery,
+    _market_duration_minutes as resolver_duration,
+    _slug_duration_minutes,
+    _title_window_minutes,
+)
 from services.risk_manager import RiskManager
 from tools.directional_limit_hunter_executor import has_duplicate_open_position
 
@@ -170,3 +176,71 @@ def test_duplicate_open_position_does_not_match_longer_condition_id(tmp_path):
 
     assert has_duplicate_open_position("0xabc", "YES", db_path=db_path) is False
     assert has_duplicate_open_position("0xabcd", "YES", db_path=db_path) is True
+
+
+def test_market_duration_detects_five_minutes_in_slug_and_title():
+    end_date = datetime(2026, 11, 20, 3, 15, tzinfo=timezone.utc)
+
+    assert resolver_duration(
+        {}, "Bitcoin Up or Down - 10:10PM-10:15PM ET", "btc-updown-5m-123", end_date
+    ) == pytest.approx(5)
+    assert (
+        _slug_duration_minutes("btc-updown-5m-123") == 5
+    )
+    assert (
+        _title_window_minutes("Bitcoin Up or Down - 10:10PM-10:15PM ET") == 5
+    )
+
+
+def test_market_duration_accepts_fifteen_minutes_or_more():
+    end_date = datetime(2026, 11, 20, 5, 0, tzinfo=timezone.utc)
+
+    assert MIN_MARKET_DURATION_MINUTES == pytest.approx(15.0)
+
+    assert _slug_duration_minutes("btc-updown-15m-123") == 15
+    assert _title_window_minutes("Bitcoin Up or Down - 11:45PM-12:00AM ET") == 15
+    assert resolver_duration(
+        {}, "Bitcoin Up or Down - 11:00PM-12:00AM ET", "btc-updown-1h-123", end_date
+    ) == pytest.approx(60)
+
+
+def test_discovery_rejects_markets_shorter_than_15_minutes(monkeypatch):
+    now = datetime.now(timezone.utc)
+    five_end = (now + timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    fifteen_end = (now + timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    class _FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return [
+                {
+                    "markets": [
+                        {
+                            "conditionId": "0x5m",
+                            "question": "Bitcoin Up or Down - 9:50PM-9:55PM ET",
+                            "slug": "btc-updown-5m-123",
+                            "endDate": five_end,
+                            "outcomePrices": '["0.5", "0.5"]',
+                            "clobTokenIds": json.dumps(["yes-5m", "no-5m"]),
+                        },
+                        {
+                            "conditionId": "0x15m",
+                            "question": "Bitcoin Up or Down - 9:45PM-10:00PM ET",
+                            "slug": "btc-updown-15m-123",
+                            "endDate": fifteen_end,
+                            "outcomePrices": '["0.5", "0.5"]',
+                            "clobTokenIds": json.dumps(["yes-15m", "no-15m"]),
+                        },
+                    ]
+                }
+            ]
+
+    monkeypatch.setattr(
+        "services.crypto_universe_discovery.requests.get",
+        lambda *args, **kwargs: _FakeResponse(),
+    )
+
+    markets = CryptoUniverseDiscovery().discover_updown_markets()
+
+    assert [m["condition_id"] for m in markets] == ["0x15m"]

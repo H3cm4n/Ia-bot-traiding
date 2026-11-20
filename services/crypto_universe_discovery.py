@@ -11,8 +11,68 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from config import MAX_HOURS_TO_EXPIRY
+from config import MAX_HOURS_TO_EXPIRY, MIN_MARKET_DURATION_MINUTES
 from services.market_resolver import MarketResolver
+
+_DURATION_SLUG_RE = re.compile(r"updown-(\d+)([mhd])\b", re.IGNORECASE)
+_WINDOW_RE = re.compile(
+    r"(\d{1,2}):(\d{2})\s*([AP]M)\s*-\s*(\d{1,2}):(\d{2})\s*([AP]M)",
+    re.IGNORECASE,
+)
+
+
+def _parse_datetime(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _slug_duration_minutes(slug):
+    match = _DURATION_SLUG_RE.search(slug or "")
+    if not match:
+        return None
+
+    amount = int(match.group(1))
+    unit = match.group(2).lower()
+    return amount * {"m": 1, "h": 60, "d": 1440}[unit]
+
+
+def _title_window_minutes(question):
+    match = _WINDOW_RE.search(question or "")
+    if not match:
+        return None
+
+    start_hour, start_min, start_ampm, end_hour, end_min, end_ampm = match.groups()
+
+    def _to_minutes(hour, minute, ampm):
+        hour = int(hour) % 12
+        if ampm.upper() == "PM":
+            hour += 12
+        return hour * 60 + int(minute)
+
+    start = _to_minutes(start_hour, start_min, start_ampm)
+    end = _to_minutes(end_hour, end_min, end_ampm)
+    if end <= start:
+        end += 24 * 60
+    return end - start
+
+
+def _market_duration_minutes(market, question, slug, end_date):
+    for duration in (
+        _slug_duration_minutes(slug),
+        _title_window_minutes(question),
+    ):
+        if duration is not None:
+            return duration
+
+    start_date = _parse_datetime(market.get("startDate"))
+    if start_date and end_date:
+        return (end_date - start_date).total_seconds() / 60
+
+    return None
 
 logger = logging.getLogger("updown_discovery")
 
@@ -73,6 +133,15 @@ class CryptoUniverseDiscovery:
                     try:
                         end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
                         if end_date <= now or end_date > max_expiry:
+                            continue
+
+                        duration_minutes = _market_duration_minutes(
+                            market, question, market.get("slug"), end_date
+                        )
+                        if (
+                            duration_minutes is not None
+                            and duration_minutes < MIN_MARKET_DURATION_MINUTES
+                        ):
                             continue
                     except Exception:
                         continue

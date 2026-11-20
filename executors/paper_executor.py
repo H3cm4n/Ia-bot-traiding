@@ -411,6 +411,8 @@ class PaperExecutor:
                     "condition_id": condition_id,
                     "end_date": candidate.get("end_date"),
                     "question": candidate.get("question"),
+                    "fair_probability": candidate.get("fair_probability"),
+                    "ask": float(limit_price),
                 },
             )
         except Exception:

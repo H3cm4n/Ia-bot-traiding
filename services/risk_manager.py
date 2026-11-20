@@ -13,16 +13,16 @@ from typing import Tuple, Optional, Dict, Any
 from config import (
     DB_PATH,
     DEFAULT_ORDER_AMOUNT_USDC,
+    MAX_EXECUTABLE_PRICE,
     MAX_HOURS_TO_EXPIRY,
     MAX_PENDING_ORDERS,
+    MIN_EXECUTABLE_PRICE,
 )
 
 logger = logging.getLogger("risk_manager")
 
 # Configuración de Riesgo por Defecto
 MAX_RISK_USD = float(os.getenv("MAX_RISK_USD", 15.0))
-MIN_EXECUTABLE_PRICE = 0.12
-MAX_EXECUTABLE_PRICE = 0.58
 
 class RiskManager:
     def __init__(
