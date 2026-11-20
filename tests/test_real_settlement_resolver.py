@@ -246,3 +246,136 @@ def test_gamma_response_for_other_market_is_not_used(resolver_env, monkeypatch):
     action, pnl, _ = _fetch_order(db_path, match_key)
     assert action == "PENDING_CREATED"
     assert notifications == []
+
+
+def _mock_api_routes(
+    monkeypatch,
+    gamma_payload,
+    clob_payload,
+    gamma_status=200,
+    clob_status=200,
+):
+    calls = []
+
+    def _fake_get(url, params=None, timeout=10):
+        calls.append({"url": url, "params": params, "timeout": timeout})
+        if "gamma-api" in url:
+            return _FakeResponse(gamma_payload, gamma_status)
+        return _FakeResponse(clob_payload, clob_status)
+
+    monkeypatch.setattr(resolver.requests, "get", _fake_get)
+    return calls
+
+
+def test_gamma_empty_falls_back_to_clob_and_settles_loss(resolver_env, monkeypatch):
+    db_path, notifications = resolver_env
+    match_key = "0xcond_NO_1795104520"
+    _insert_order(db_path, match_key, side="NO", price=0.40, amount=10.0)
+
+    calls = _mock_api_routes(
+        monkeypatch,
+        [],
+        {
+            "condition_id": "0xcond",
+            "closed": True,
+            "tokens": [
+                {"outcome": "Up", "winner": True},
+                {"outcome": "Down", "winner": False},
+            ],
+        },
+    )
+
+    resolver.check_and_settle_real_markets()
+
+    action, pnl, _ = _fetch_order(db_path, match_key)
+    assert action == "LOSS"
+    assert pnl == pytest.approx(-10.0)
+    assert calls[0]["params"] == {"condition_ids": "0xcond"}
+    assert calls[1]["url"] == "https://clob.polymarket.com/markets/0xcond"
+    assert notifications[0][0]["action"] == "LOSS"
+
+
+def test_gamma_other_market_falls_back_to_clob_and_settles_win(
+    resolver_env, monkeypatch
+):
+    db_path, notifications = resolver_env
+    match_key = "0xcond_YES_1795104520"
+    _insert_order(db_path, match_key, side="YES", price=0.40, amount=10.0)
+
+    calls = _mock_api_routes(
+        monkeypatch,
+        [
+            {
+                "conditionId": "0xother",
+                "closed": True,
+                "outcomes": '["Yes", "No"]',
+                "outcomePrices": '["1", "0"]',
+            }
+        ],
+        {
+            "condition_id": "0xcond",
+            "closed": True,
+            "tokens": [
+                {"outcome": "Up", "winner": True},
+                {"outcome": "Down", "winner": False},
+            ],
+        },
+    )
+
+    resolver.check_and_settle_real_markets()
+
+    action, pnl, _ = _fetch_order(db_path, match_key)
+    assert action == "WIN"
+    assert pnl == pytest.approx(15.0)
+    assert calls[1]["url"] == "https://clob.polymarket.com/markets/0xcond"
+    assert notifications[0][0]["action"] == "WIN"
+
+
+def test_clob_without_definitive_winner_stays_pending(resolver_env, monkeypatch):
+    db_path, notifications = resolver_env
+    match_key = "0xcond_YES_1795104520"
+    _insert_order(db_path, match_key)
+
+    _mock_api_routes(
+        monkeypatch,
+        [],
+        {
+            "condition_id": "0xcond",
+            "closed": True,
+            "tokens": [
+                {"outcome": "Up", "winner": False},
+                {"outcome": "Down", "winner": False},
+            ],
+        },
+    )
+
+    resolver.check_and_settle_real_markets()
+
+    action, _, _ = _fetch_order(db_path, match_key)
+    assert action == "PENDING_CREATED"
+    assert notifications == []
+
+
+def test_clob_not_closed_stays_pending(resolver_env, monkeypatch):
+    db_path, notifications = resolver_env
+    match_key = "0xcond_YES_1795104520"
+    _insert_order(db_path, match_key)
+
+    _mock_api_routes(
+        monkeypatch,
+        [],
+        {
+            "condition_id": "0xcond",
+            "closed": False,
+            "tokens": [
+                {"outcome": "Up", "winner": True},
+                {"outcome": "Down", "winner": False},
+            ],
+        },
+    )
+
+    resolver.check_and_settle_real_markets()
+
+    action, _, _ = _fetch_order(db_path, match_key)
+    assert action == "PENDING_CREATED"
+    assert notifications == []

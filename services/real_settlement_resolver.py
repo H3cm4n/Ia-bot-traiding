@@ -18,6 +18,7 @@ logging.basicConfig(level=logging.INFO)
 
 DB_PATH = os.environ.get("DIRECTIONAL_DB_PATH", "data/trading_bot.db")
 GAMMA_API_URL = "https://gamma-api.polymarket.com/markets"
+CLOB_API_URL = "https://clob.polymarket.com/markets"
 
 
 def _parse_list_field(value):
@@ -93,6 +94,38 @@ def _select_market(markets, condition_id):
     return None
 
 
+def _as_bool(value):
+    return value is True or str(value).lower() == "true"
+
+
+def _market_from_clob(payload, condition_id):
+    """Normaliza la respuesta de CLOB a un mercado Gamma-like resoluble."""
+    if not isinstance(payload, dict):
+        return None
+
+    payload_cid = payload.get("condition_id") or payload.get("conditionId")
+    if payload_cid and str(payload_cid).lower() != str(condition_id).lower():
+        return None
+
+    if not _is_market_closed(payload):
+        return None
+
+    tokens = payload.get("tokens")
+    if not isinstance(tokens, list) or not tokens:
+        return None
+
+    winners = [_as_bool(token.get("winner")) for token in tokens]
+    if sum(winners) != 1:
+        return None
+
+    return {
+        "conditionId": payload_cid or condition_id,
+        "closed": True,
+        "outcomes": [token.get("outcome") for token in tokens],
+        "outcomePrices": [1.0 if winner else 0.0 for winner in winners],
+    }
+
+
 def _settle_order(cursor, trade_id, match_key, symbol, side, limit_price, amount, market):
     if not _is_market_closed(market):
         return None
@@ -143,9 +176,13 @@ def _settle_order(cursor, trade_id, match_key, symbol, side, limit_price, amount
         UPDATE orders_history
         SET action = ?, pnl = ?
         WHERE id = ?
+          AND action IN ('PENDING_CREATED', 'OPEN')
         """,
         (new_action, pnl, trade_id),
     )
+    if cursor.rowcount == 0:
+        return None
+
     logger.info(f"[RESOLVED] Trade ID {trade_id} -> {new_action} | PnL: ${pnl:.2f}")
     return {
         "match_key": match_key,
@@ -190,21 +227,44 @@ def check_and_settle_real_markets():
                 logger.warning(f"[SKIP] Sin condition_id para trade ID {trade_id}")
                 continue
 
-            resp = requests.get(
-                GAMMA_API_URL, params={"condition_ids": cond_id}, timeout=10
-            )
-            if resp.status_code != 200:
-                logger.warning(
-                    f"[SKIP] Gamma API HTTP {resp.status_code} para {cond_id}"
+            market = None
+            try:
+                resp = requests.get(
+                    GAMMA_API_URL, params={"condition_ids": cond_id}, timeout=10
                 )
-                continue
+                if resp.status_code == 200:
+                    market = _select_market(
+                        _extract_markets(resp.json()), cond_id
+                    )
+                else:
+                    logger.warning(
+                        f"[WARN] Gamma API HTTP {resp.status_code} para {cond_id}"
+                    )
+            except requests.RequestException as exc:
+                logger.warning(f"[WARN] Error Gamma API para {cond_id}: {exc}")
 
-            markets = _extract_markets(resp.json())
-            market = _select_market(markets, cond_id)
+            if not market:
+                logger.info(
+                    f"[FALLBACK] Gamma sin mercado {cond_id}; consultando CLOB API..."
+                )
+                try:
+                    clob_resp = requests.get(
+                        f"{CLOB_API_URL}/{cond_id}", timeout=10
+                    )
+                    if clob_resp.status_code == 200:
+                        market = _market_from_clob(clob_resp.json(), cond_id)
+                    else:
+                        logger.warning(
+                            f"[WARN] CLOB API HTTP {clob_resp.status_code} "
+                            f"para {cond_id}"
+                        )
+                except requests.RequestException as exc:
+                    logger.warning(f"[WARN] Error CLOB API para {cond_id}: {exc}")
+
             if not market:
                 logger.warning(
-                    f"[SKIP] Gamma API no devolvió el mercado {cond_id} "
-                    f"para trade ID {trade_id}"
+                    f"[SKIP] Sin mercado resoluble Gamma/CLOB para {cond_id} "
+                    f"(trade ID {trade_id})"
                 )
                 continue
 
