@@ -407,6 +407,11 @@ class PaperExecutor:
                 side=outcome,
                 price=float(limit_price),
                 amount=amount,
+                raw_data={
+                    "condition_id": condition_id,
+                    "end_date": candidate.get("end_date"),
+                    "question": candidate.get("question"),
+                },
             )
         except Exception:
             logger.exception(

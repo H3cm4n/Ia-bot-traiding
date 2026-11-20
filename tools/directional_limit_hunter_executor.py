@@ -6,6 +6,7 @@ Ejecutor v3.0 Integrado: Discovery -> Fair Value -> Manipulation Guard -> Kelly 
 import sys
 import json
 import logging
+import sqlite3
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -13,6 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from config import DB_PATH
 from services.crypto_universe_discovery import CryptoUniverseDiscovery
 from services.clob_client import PolymarketCLOBClient
 from models.market_manipulation_guard import MarketManipulationGuard
@@ -25,6 +27,37 @@ from database.db_manager import log_order_event, log_rejected_candidate, log_wha
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("full_integration")
+
+
+def has_duplicate_open_position(condition_id, side, db_path=None):
+    """Bloquea una nueva orden si ya hay PENDING_CREATED/OPEN para condition_id+side."""
+    if not condition_id or not side:
+        return False
+
+    target_db = Path(db_path) if db_path else Path(DB_PATH)
+    if not target_db.exists():
+        return False
+
+    prefix = f"{condition_id}_{str(side).upper()}_"
+    try:
+        with sqlite3.connect(str(target_db)) as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM orders_history
+                WHERE action IN ('PENDING_CREATED', 'OPEN')
+                  AND substr(match_key, 1, ?) = ?
+                  AND UPPER(side) = ?
+                LIMIT 1
+                """,
+                (len(prefix), prefix, str(side).upper()),
+            ).fetchone()
+    except sqlite3.Error as exc:
+        logger.error(f"Error consultando posiciones abiertas: {exc}")
+        return True
+
+    return row is not None
+
 
 def get_candle_open(guard, symbol, interval="1h"):
     """Obtiene el precio de apertura de la vela actual en Binance."""
@@ -105,7 +138,24 @@ def run_e2e_cycle():
         condition_id = m["condition_id"]
         question = m["question"]
         q_upper = question.upper()
-        
+
+        expiry_ok, expiry_reason = risk.validate_expiry(m.get("end_date"))
+        if not expiry_ok:
+            logger.info(f"[RISK] Candidato {symbol} rechazado: {expiry_reason}")
+            log_rejected_candidate(
+                match_key=condition_id,
+                reason=expiry_reason,
+                fair_probability=0.0,
+                executable_price=0.0,
+                edge=0.0,
+                raw_data={
+                    "condition_id": condition_id,
+                    "end_date": m.get("end_date"),
+                    "question": question,
+                },
+            )
+            continue
+
         # 1. Validación de Strike / Dirección
         if not m["is_updown"] and m["strike_price"] is None:
             continue
@@ -175,11 +225,27 @@ def run_e2e_cycle():
         if not best_outcome or best_outcome["edge"] <= 0:
             continue
 
-        # 5. Risk Management & Kelly Sizing
-        if risk.has_open_position(condition_id):
+        # 5. Deduplicación por condition_id + side y Gestión de Riesgo
+        side = best_outcome["side"]
+        if has_duplicate_open_position(condition_id, side):
+            logger.info(
+                f"[RISK] Candidato {symbol} rechazado: DUPLICATE_OPEN_POSITION"
+            )
+            log_rejected_candidate(
+                match_key=f"{condition_id}_{side}",
+                reason="DUPLICATE_OPEN_POSITION",
+                fair_probability=best_outcome["fair_prob"],
+                executable_price=best_outcome["price"],
+                edge=best_outcome["edge"],
+                raw_data={"condition_id": condition_id, "side": side},
+            )
             continue
 
-        is_valid, reason, size_usd = risk.validate_trade(best_outcome["fair_prob"], best_outcome["price"])
+        is_valid, reason, size_usd = risk.validate_trade(
+            best_outcome["fair_prob"],
+            best_outcome["price"],
+            end_date_iso=m.get("end_date"),
+        )
         if not is_valid:
             if reason != "HAS_OPEN_POSITION":
                 logger.info(f"[RISK] Candidato {symbol} rechazado: {reason}")
@@ -205,7 +271,6 @@ def run_e2e_cycle():
             continue
 
         # 6.5 Whale Integration
-        side = best_outcome["side"]
         condition_whale_data = whale_tracker.get_whale_activity(condition_id)
         asset_whale_data = whale_tracker.get_asset_whale_activity(symbol)
 
@@ -266,7 +331,8 @@ def run_e2e_cycle():
             "amount": size_usd,
             "target_size_usdc": size_usd,
             "fair_probability": best_outcome["fair_prob"],
-            "question": question
+            "question": question,
+            "end_date": m.get("end_date"),
         }]
 
         

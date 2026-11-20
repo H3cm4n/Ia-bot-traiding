@@ -6,12 +6,14 @@ Gestión de riesgo centralizada y Sizing Dinámico con Criterio de Kelly Fraccio
 import os
 import sqlite3
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Tuple, Optional, Dict, Any
 
 from config import (
     DB_PATH,
     DEFAULT_ORDER_AMOUNT_USDC,
+    MAX_HOURS_TO_EXPIRY,
     MAX_PENDING_ORDERS,
 )
 
@@ -171,10 +173,48 @@ class RiskManager:
         except Exception:
             return False
 
-    def validate_trade(self, fair_prob: float, price: float) -> Tuple[bool, str, float]:
+    def validate_expiry(
+        self, end_date_iso: str, now: Optional[datetime] = None
+    ) -> Tuple[bool, str]:
+        """Rechaza mercados expirados o con cierre superior a MAX_HOURS_TO_EXPIRY."""
+        if not end_date_iso:
+            return False, "EXPIRY_OUT_OF_RANGE"
+
+        try:
+            end_date = datetime.fromisoformat(
+                str(end_date_iso).strip().replace("Z", "+00:00")
+            )
+        except (TypeError, ValueError):
+            return False, "EXPIRY_OUT_OF_RANGE"
+
+        if end_date.tzinfo is None:
+            end_date = end_date.replace(tzinfo=timezone.utc)
+
+        reference = now or datetime.now(timezone.utc)
+        if reference.tzinfo is None:
+            reference = reference.replace(tzinfo=timezone.utc)
+
+        seconds_left = (end_date - reference).total_seconds()
+        if seconds_left <= 0 or seconds_left > MAX_HOURS_TO_EXPIRY * 3600:
+            return False, "EXPIRY_OUT_OF_RANGE"
+
+        return True, "PASSED"
+
+    def validate_trade(
+        self,
+        fair_prob: float,
+        price: float,
+        end_date_iso: Optional[str] = None,
+        now: Optional[datetime] = None,
+    ) -> Tuple[bool, str, float]:
         """Validación integral antes de disparar."""
         if self.is_kill_switch_active():
             return False, "KILL_SWITCH_ACTIVE", 0.0
+
+        if end_date_iso is not None:
+            expiry_ok, expiry_reason = self.validate_expiry(end_date_iso, now=now)
+            if not expiry_ok:
+                return False, expiry_reason, 0.0
 
         if price < MIN_EXECUTABLE_PRICE or price > MAX_EXECUTABLE_PRICE:
             return False, "PRICE_OUT_OF_ASYMMETRIC_RANGE", 0.0

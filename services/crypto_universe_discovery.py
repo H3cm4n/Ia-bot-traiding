@@ -4,13 +4,14 @@ import logging
 import requests
 import re
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from config import MAX_HOURS_TO_EXPIRY
 from services.market_resolver import MarketResolver
 
 logger = logging.getLogger("updown_discovery")
@@ -25,25 +26,29 @@ class CryptoUniverseDiscovery:
     def discover_updown_markets(self) -> List[Dict[str, Any]]:
         """
         Descubre mercados 'Up/Down' (Price Above/Below) para los símbolos objetivo.
-        Filtra contratos horarios, diarios y semanales.
+        Filtra contratos con vencimiento en la ventana de MAX_HOURS_TO_EXPIRY.
         Implementa pre-filtrado de mercados zombis.
         """
         discovered = []
         try:
-            # Consultar eventos activos con keywords ampliadas
+            now = datetime.now(timezone.utc)
+            max_expiry = now + timedelta(hours=MAX_HOURS_TO_EXPIRY)
+
+            # Consultar eventos activos dentro de la ventana corta de vencimiento
             params = {
                 "closed": "false",
                 "active": "true",
-                "limit": 200, # Aumentado para mayor cobertura
-                "order": "volume",
-                "ascending": "false"
+                "limit": 200,
+                "order": "endDate",
+                "ascending": "true",
+                "end_date_min": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "end_date_max": max_expiry.strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
             resp = requests.get(self.gamma_api_url, params=params, timeout=10)
             if resp.status_code != 200:
                 return []
 
             events = resp.json()
-            now = datetime.now(timezone.utc)
 
             for event in events:
                 markets = event.get("markets", [])
@@ -67,9 +72,9 @@ class CryptoUniverseDiscovery:
                         continue
                     try:
                         end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
-                        if end_date <= now:
+                        if end_date <= now or end_date > max_expiry:
                             continue
-                    except:
+                    except Exception:
                         continue
 
                     # 3. Pre-filtro de Precios y Spread (Zombis)
